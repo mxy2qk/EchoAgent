@@ -175,19 +175,6 @@ Clicking Stop in the web UI force-stops the project container with:
 docker stop -t 0 <container>
 ```
 
-## Repository Hygiene
-
-Runtime data is stored under `.echo_agent/` and should not be committed.
-
-The repository `.gitignore` excludes:
-
-- `.echo_agent/`
-- SQLite databases
-- local `echo_agent.toml`
-- Python cache directories
-
-Commit `echo_agent.toml.example`, not your local `echo_agent.toml`.
-
 ## Tests
 
 ```bash
