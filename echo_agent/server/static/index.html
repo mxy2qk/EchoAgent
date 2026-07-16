@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EchoAgent Console</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>EchoAgent</h1>
+        <p>CTF / 渗透项目调度控制台</p>
+      </div>
+      <div class="status-line" id="connection-status">connecting</div>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar">
+        <section class="section">
+          <h2>创建项目</h2>
+          <form id="create-project-form" class="project-form">
+            <label>
+              目标 URL
+              <input name="target_url" type="url" placeholder="https://target.example" required />
+            </label>
+            <label>
+              Hint
+              <textarea name="hint" rows="3" placeholder="题目提示、范围或账号信息"></textarea>
+            </label>
+            <label>
+              需要完成的工作
+              <textarea name="objective" rows="4" placeholder="例如：找到目标系统 flag 并说明利用路径" required></textarea>
+            </label>
+            <button type="submit">创建</button>
+          </form>
+        </section>
+
+        <section class="section">
+          <div class="section-header">
+            <h2>项目</h2>
+            <button id="refresh-projects" type="button">刷新</button>
+          </div>
+          <div id="project-list" class="project-list"></div>
+        </section>
+      </aside>
+
+      <section class="workspace">
+        <div class="project-header">
+          <div>
+            <h2 id="project-title">选择项目</h2>
+          <p id="project-subtitle">查看任务输入、fact / intent 图和运行状态</p>
+          </div>
+          <div class="actions">
+            <button id="activate-project" type="button" disabled>激活</button>
+            <button id="run-project" type="button" disabled>运行</button>
+            <button id="stop-project" type="button" disabled>停止</button>
+            <button id="delete-project" class="danger" type="button" disabled>删除</button>
+            <button id="refresh-current" type="button" disabled>刷新当前</button>
+          </div>
+        </div>
+
+        <div class="summary-row" id="summary-row">
+          <div><span>状态</span><strong>-</strong></div>
+          <div><span>目标</span><strong>-</strong></div>
+          <div><span>图</span><strong>-</strong></div>
+          <div><span>Docker</span><strong>-</strong></div>
+          <div><span>调度</span><strong>-</strong></div>
+        </div>
+
+        <div class="graph-shell">
+          <div class="graph-toolbar" aria-label="图缩放控制">
+            <button id="graph-zoom-out" type="button">缩小</button>
+            <button id="graph-zoom-in" type="button">放大</button>
+            <button id="graph-zoom-fit" type="button">适配</button>
+            <button id="graph-zoom-reset" type="button">重置</button>
+            <span><em>Ctrl+滚轮缩放</em> · <strong id="graph-zoom-label">100%</strong></span>
+          </div>
+          <div id="graph-viewport" class="graph-viewport">
+            <svg id="project-graph" viewBox="0 0 900 520" role="img" aria-label="项目图"></svg>
+          </div>
+          <div id="graph-detail" class="graph-detail empty-detail">点击 fact 节点或 intent 边查看详情</div>
+        </div>
+      </section>
+
+      <aside class="logs-panel">
+        <div class="section-header">
+          <h2>关键日志</h2>
+          <div class="actions">
+            <button id="refresh-logs" type="button" disabled>刷新</button>
+            <button id="clear-logs" class="danger" type="button" disabled>清空</button>
+          </div>
+        </div>
+        <div id="log-list" class="log-list"></div>
+      </aside>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

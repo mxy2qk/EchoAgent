@@ -1,0 +1,90 @@
+# EchoAgent configuration template.
+# Copy this file to echo_agent.toml and edit it for your local environment.
+# Environment variables override TOML values.
+
+[server]
+# Web UI/API bind address.
+host = "127.0.0.1"
+port = 8000
+
+# SQLite database path. Runtime state under .echo_agent/ should not be committed.
+database_path = ".echo_agent/echo_agent.db"
+
+[dispatcher]
+# Internal URL used by CLI/dispatcher clients to call the server API.
+server_url = "http://127.0.0.1:8000"
+
+# Delay between dispatch-loop steps.
+interval_seconds = 3.0
+
+# Max concurrent explore intents. Lower this if your model provider/proxy is unstable.
+explore_max_workers = 4
+
+[codex]
+# Codex CLI command executed inside the project Docker container.
+command = ["codex", "exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-"]
+
+# Default and per-mode models.
+model = "gpt-5.5"
+first_run_model = "gpt-5.5"
+explore_model = "gpt-5.5"
+reason_model = "gpt-5.5"
+
+# Working directory inside the project container.
+workspace = "/home/kali/workspace"
+
+# Hard process timeout for one Codex invocation.
+timeout_seconds = 1800
+
+# Kill Codex if there is no stdout/stderr activity for this many seconds.
+# Set to 0 to disable this idle guard and rely only on timeout_seconds.
+no_output_timeout_seconds = 900
+first_run_no_output_timeout_seconds = 900
+explore_no_output_timeout_seconds = 180
+reason_no_output_timeout_seconds = 300
+
+# Prefer OPENAI_API_KEY / ECHO_AGENT_OPENAI_API_KEY instead of storing a key here.
+api_key = ""
+base_url = "https://your-provider.example/v1"
+
+# EchoAgent injects this provider into Codex via "-c model_providers...".
+provider_name = "echo_agent_proxy"
+supports_websockets = false
+request_max_retries = 2
+stream_max_retries = 2
+stream_idle_timeout_ms = 60000
+
+[docker]
+# Worker image build/run settings.
+image = "echo-agent-worker"
+context = "container"
+dockerfile = "container/Dockerfile"
+build_network = "host"
+
+[resources]
+# Shared host directory for tools, PoCs, templates, and knowledge bases.
+# It is prepared when the server starts and mounted into every project container.
+# "{project_id}" and "{project_name}" are supported if you need project-local resources.
+root = ".echo_agent/resources"
+
+# Resource item fields:
+# - name: human-readable log label
+# - path: host path relative to resources.root, or absolute path
+# - container_path: mount destination in the worker container
+# - read_only: mount mode
+# - url: optional download URL; without url EchoAgent only creates the directory
+# - archive: set true when url points to a zip/tar archive that should be extracted
+# - archive_single_file: set true to extract the first file in an archive to exactly "path"
+# - executable: chmod downloaded/extracted file(s) so binaries can run
+items = [
+  { name = "nuclei-templates", url = "https://github.com/projectdiscovery/nuclei-templates/archive/refs/heads/main.zip", archive = true, path = "nuclei-templates", container_path = "/home/kali/.local/nuclei-templates", read_only = false },
+  { name = "katana", url = "https://github.com/projectdiscovery/katana/releases/download/v1.5.0/katana_1.5.0_linux_amd64.zip", archive = true, archive_single_file = true, executable = true, path = "local-bin/katana", container_path = "/home/kali/.local/bin/katana", read_only = true },
+  { name = "nuclei", url = "https://github.com/projectdiscovery/nuclei/releases/download/v3.7.1/nuclei_3.7.1_linux_amd64.zip", archive = true, archive_single_file = true, executable = true, path = "local-bin/nuclei", container_path = "/home/kali/.local/bin/nuclei", read_only = true },
+  { name = "dalfox", url = "https://github.com/hahwul/dalfox/releases/download/v2.12.0/dalfox-linux-amd64.tar.gz", archive = true, archive_single_file = true, executable = true, path = "local-bin/dalfox", container_path = "/home/kali/.local/bin/dalfox", read_only = true },
+  { name = "cloudfox", url = "https://github.com/BishopFox/cloudfox/releases/download/v2.0.1/cloudfox-linux-amd64.zip", archive = true, archive_single_file = true, executable = true, path = "local-bin/cloudfox", container_path = "/home/kali/.local/bin/cloudfox", read_only = true },
+  { name = "kerbrute", url = "https://github.com/ropnop/kerbrute/releases/download/v1.0.3/kerbrute_linux_amd64", executable = true, path = "local-bin/kerbrute", container_path = "/home/kali/.local/bin/kerbrute", read_only = true },
+  { name = "pocs", path = "pocs", container_path = "/home/kali/pocs", read_only = false },
+  { name = "tools", path = "tools", container_path = "/home/kali/tools", read_only = false },
+  { name = "knowledges", path = "knowledges", container_path = "/home/kali/knowledges", read_only = false },
+  # { name = "php-filter-chain", url = "https://example.com/php-filter-chain.txt", path = "knowledges/php-filter-chain.txt", container_path = "/home/kali/knowledges/php-filter-chain.txt", read_only = true },
+]

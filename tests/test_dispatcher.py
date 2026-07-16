@@ -1,0 +1,502 @@
+from __future__ import annotations
+
+import copy
+import time
+import unittest
+from typing import Any
+
+from echo_agent.dispatcher.core import Dispatcher
+from echo_agent.dispatcher.types import DispatchMode, ReasonResult, WorkerResult
+from echo_agent.models import Project, ProjectStatus
+
+
+class MemoryProjectClient:
+    def __init__(self, project: Project) -> None:
+        self.project = project
+        self.logs: list[dict[str, Any]] = []
+        self.saved_projects: list[Project] = []
+
+    def get_project(self, project_id: int) -> Project:
+        self.assert_project_id(project_id)
+        return copy.deepcopy(self.project)
+
+    def save_project(self, project: Project) -> dict[str, Any]:
+        self.assert_project_id(project.id)
+        self.project = copy.deepcopy(project)
+        self.saved_projects.append(copy.deepcopy(project))
+        return self.project.to_dict()
+
+    def add_project_log(
+        self,
+        project_id: int,
+        message: str,
+        level: str = "info",
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        self.assert_project_id(project_id)
+        self.logs.append({"message": message, "level": level, "metadata": metadata or {}})
+
+    def assert_project_id(self, project_id: int) -> None:
+        if project_id != self.project.id:
+            raise AssertionError(f"unexpected project id: {project_id}")
+
+
+class StaticWorker:
+    def __init__(self, fact_description: str) -> None:
+        self.fact_description = fact_description
+
+    def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+        return WorkerResult(answer=None, fact_description=self.fact_description)
+
+
+class FailingWorker:
+    def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+        raise RuntimeError("agent stalled")
+
+
+class OrderedConcurrentWorker:
+    def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+        if intent.id == 0:
+            time.sleep(0.01)
+            return WorkerResult(answer=None, fact_description="first fact")
+        time.sleep(0.1)
+        return WorkerResult(answer=None, fact_description="second fact")
+
+
+class IntentFactWorker:
+    def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+        return WorkerResult(answer=None, fact_description=f"fact from intent {intent.id}")
+
+
+class FlagWorker:
+    def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+        return WorkerResult(answer="flag{ok}", fact_description=None)
+
+
+class PlaceholderAnswerWorker:
+    def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+        return WorkerResult(answer="真实 flag 字符串", fact_description=None)
+
+
+class FlagFactWorker:
+    def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+        return WorkerResult(answer=None, fact_description="confirmed final answer flag{fact}")
+
+
+class StaticReasoner:
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(
+            completed=False,
+            next_intents=[
+                {"from": 2, "to": None, "description": "枚举目录"},
+                {"from": 2, "to": None, "description": "测试上传点"},
+            ],
+        )
+
+
+class EmptyReasoner:
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(completed=False, next_intents=[])
+
+
+class CompletedReasoner:
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(completed=True, next_intents=[])
+
+
+class FlagReasoner:
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(completed=True, answer="flag{reason}", next_intents=[])
+
+
+class GraphAnswerReasoner:
+    def plan(self, project: Project) -> ReasonResult:
+        answers = [
+            fact.description.removeprefix("agent reported possible final answer: ").strip()
+            for fact in project.facts.values()
+            if fact.description.startswith("agent reported possible final answer: ")
+        ]
+        if answers:
+            return ReasonResult(completed=True, answer=answers[-1], next_intents=[])
+        return ReasonResult(completed=False, next_intents=[])
+
+
+class LegacyReasoner:
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(completed=False, next_intent_descriptions=["分析是否存在文件上传漏洞"])
+
+
+class DispatcherFactInsertionTests(unittest.TestCase):
+    def test_first_run_fact_completes_initial_intent_without_auto_bridge(self) -> None:
+        project = Project(
+            id=1,
+            name="test",
+            status=ProjectStatus.ACTIVE,
+            target_url="http://target",
+            objective="get flag",
+        )
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("discovered web framework: flask"),  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id)
+
+        saved = client.project
+        self.assertEqual(saved.facts[2].description, "discovered web framework: flask")
+        self.assertEqual(saved.intents[0].from_fact_id, 0)
+        self.assertEqual(saved.intents[0].to_fact_id, 2)
+        self.assertTrue(saved.intents[0].is_completed)
+        self.assertEqual(len(saved.intents), 1)
+        self.assertEqual(saved.active_intents(), [])
+
+    def test_first_run_failure_becomes_fact_for_reason(self) -> None:
+        project = Project(
+            id=1,
+            name="test",
+            status=ProjectStatus.ACTIVE,
+            target_url="http://target",
+            objective="get flag",
+        )
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=FailingWorker(),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id)
+
+        saved = client.project
+        self.assertEqual(result.mode, DispatchMode.FIRST_RUN)
+        self.assertIn("first-run execution failed", saved.facts[2].description)
+        self.assertEqual(saved.intents[0].to_fact_id, 2)
+        self.assertTrue(saved.intents[0].is_completed)
+        self.assertEqual(saved.status, ProjectStatus.STOPED)
+
+    def test_no_output_timeout_failure_fact_is_actionable(self) -> None:
+        fact = Dispatcher._execution_failed_fact(
+            "intent 3",
+            RuntimeError("codex agent no-output timed out in explore mode after 900s without stdout/stderr"),
+        )
+
+        self.assertIn("Codex 长时间无 stdout/stderr 输出", fact)
+        self.assertIn("重新规划更小的验证步骤", fact)
+
+    def test_reason_can_branch_multiple_intents_from_same_fact(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("web service exposes upload form", fact_id=2)
+        seed_intent = project.add_intent("initial discovery", from_fact_id=0, to_fact_id=2)
+        seed_intent.mark_running()
+        seed_intent.mark_completed()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=StaticReasoner(),  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id)
+
+        saved = client.project
+        branch_intents = [intent for intent in saved.intents.values() if intent.from_fact_id == 2]
+        self.assertEqual(len(branch_intents), 2)
+        self.assertEqual([intent.description for intent in branch_intents], ["枚举目录", "测试上传点"])
+        self.assertTrue(all(intent.to_fact_id == 1 for intent in branch_intents))
+
+    def test_reason_creates_next_intents_after_first_run_fact(self) -> None:
+        project = Project(
+            id=1,
+            name="test",
+            status=ProjectStatus.ACTIVE,
+            target_url="http://target",
+            objective="get flag",
+        )
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("web service exposes upload form"),  # type: ignore[arg-type]
+            reasoner=StaticReasoner(),  # type: ignore[arg-type]
+        )
+
+        first_result = dispatcher.run_once(project.id)
+        second_result = dispatcher.run_once(project.id)
+
+        self.assertEqual(first_result.mode, DispatchMode.FIRST_RUN)
+        self.assertEqual(second_result.mode, DispatchMode.REASON)
+        saved = client.project
+        self.assertEqual(saved.intents[0].from_fact_id, 0)
+        self.assertEqual(saved.intents[0].to_fact_id, 2)
+        branch_intents = [intent for intent in saved.intents.values() if intent.from_fact_id == 2]
+        self.assertEqual(len(branch_intents), 2)
+        self.assertEqual([intent.description for intent in branch_intents], ["枚举目录", "测试上传点"])
+        self.assertTrue(all(intent.to_fact_id == 1 for intent in branch_intents))
+
+    def test_explore_saves_each_completed_intent_before_all_finish(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("web service exposes upload form", fact_id=2)
+        project.add_intent("fast intent", from_fact_id=2, to_fact_id=1)
+        project.add_intent("slow intent", from_fact_id=2, to_fact_id=1)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=OrderedConcurrentWorker(),  # type: ignore[arg-type]
+            max_explore_workers=2,
+        )
+
+        dispatcher.run_once(project.id)
+
+        progressive_snapshots = [
+            snapshot
+            for snapshot in client.saved_projects
+            if (
+                len(snapshot.facts) == 4
+                and snapshot.intents[0].is_completed
+                and snapshot.intents[0].to_fact_id == 3
+                and snapshot.intents[1].status.value == "running"
+                and snapshot.intents[1].to_fact_id == 1
+            )
+        ]
+        self.assertTrue(progressive_snapshots)
+        saved = client.project
+        self.assertTrue(saved.intents[0].is_completed)
+        self.assertTrue(saved.intents[1].is_completed)
+        self.assertEqual(saved.intents[0].to_fact_id, 3)
+        self.assertEqual(saved.intents[1].to_fact_id, 4)
+        self.assertEqual(saved.facts[3].description, "first fact")
+        self.assertEqual(saved.facts[4].description, "second fact")
+
+    def test_explore_answer_is_inserted_as_fact_for_reason_judgement(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("web service exposes upload form", fact_id=2)
+        project.add_intent("try exploit", from_fact_id=2, to_fact_id=1)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=FlagWorker(),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id)
+
+        self.assertEqual(result.mode, DispatchMode.EXPLORE)
+        self.assertEqual(client.project.status, ProjectStatus.STOPED)
+        self.assertEqual(client.project.intents[0].to_fact_id, 3)
+        self.assertTrue(client.project.intents[0].is_completed)
+        self.assertEqual(client.project.facts[1].description, "goal")
+        self.assertEqual(client.project.facts[3].description, "agent reported possible final answer: flag{ok}")
+
+    def test_first_run_answer_is_inserted_as_fact_for_reason_judgement(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=FlagWorker(),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id)
+
+        self.assertEqual(result.mode, DispatchMode.FIRST_RUN)
+        self.assertEqual(client.project.facts[1].description, "goal")
+        self.assertEqual(client.project.facts[2].description, "agent reported possible final answer: flag{ok}")
+
+    def test_explore_fact_with_flag_form_does_not_complete_without_reason(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("web service exposes upload form", fact_id=2)
+        project.add_intent("try exploit", from_fact_id=2, to_fact_id=1)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=FlagFactWorker(),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id)
+
+        self.assertEqual(result.mode, DispatchMode.EXPLORE)
+        self.assertEqual(client.project.status, ProjectStatus.STOPED)
+        self.assertEqual(client.project.facts[1].description, "goal")
+        self.assertEqual(client.project.facts[3].description, "confirmed final answer flag{fact}")
+
+    def test_explore_placeholder_answer_does_not_complete_or_update_end_fact(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("web service exposes upload form", fact_id=2)
+        project.add_intent("try exploit", from_fact_id=2, to_fact_id=1)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=PlaceholderAnswerWorker(),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id)
+
+        self.assertEqual(result.mode, DispatchMode.EXPLORE)
+        self.assertEqual(client.project.status, ProjectStatus.STOPED)
+        self.assertEqual(client.project.facts[1].description, "goal")
+        self.assertTrue(client.project.intents[0].is_completed)
+
+    def test_reason_completed_updates_end_fact_to_result(self) -> None:
+        project = self._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=FlagReasoner(),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id)
+
+        self.assertEqual(result.mode, DispatchMode.COMPLETED)
+        self.assertEqual(client.project.facts[1].description, "result\nanswer: flag{reason}")
+        self.assertFalse(
+            any(intent.to_fact_id == 1 and intent.description == "确认该事实包含最终答案" for intent in client.project.intents.values())
+        )
+
+    def test_existing_graph_answer_only_completes_after_reason_judgement(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("agent reported possible final answer: flag{graph}", fact_id=2)
+        seed_intent = project.add_intent("initial discovery", from_fact_id=0, to_fact_id=2)
+        seed_intent.mark_running()
+        seed_intent.mark_completed()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=GraphAnswerReasoner(),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id)
+
+        self.assertEqual(result.mode, DispatchMode.COMPLETED)
+        self.assertEqual(client.project.facts[1].description, "result\nanswer: flag{graph}")
+        answer_edges = [
+            intent
+            for intent in client.project.intents.values()
+            if intent.from_fact_id == 2 and intent.to_fact_id == 1
+        ]
+        self.assertEqual(len(answer_edges), 1)
+        self.assertEqual(answer_edges[0].description, "确认该事实包含最终答案")
+        self.assertTrue(answer_edges[0].is_completed)
+
+    def test_reason_answer_does_not_create_goal_edge_without_source_fact(self) -> None:
+        project = self._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=FlagReasoner(),  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id)
+
+        self.assertFalse(
+            any(intent.to_fact_id == 1 and intent.description == "确认该事实包含最终答案" for intent in client.project.intents.values())
+        )
+
+    def test_run_loop_continues_to_reason_after_parallel_explore_facts_without_flag(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("web service exposes upload form", fact_id=2)
+        for index in range(5):
+            project.add_intent(f"intent {index}", from_fact_id=2)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=IntentFactWorker(),  # type: ignore[arg-type]
+            reasoner=StaticReasoner(),  # type: ignore[arg-type]
+            max_explore_workers=5,
+        )
+
+        results = dispatcher.run_loop(project.id, interval_seconds=0, max_steps=2)
+
+        self.assertEqual([result.mode for result in results], [DispatchMode.EXPLORE, DispatchMode.REASON])
+        saved = client.project
+        self.assertEqual(len([intent for intent in saved.intents.values() if intent.is_completed]), 5)
+        branch_intents = [
+            intent
+            for intent in saved.intents.values()
+            if intent.from_fact_id == 2 and intent.is_executable
+        ]
+        self.assertEqual([intent.description for intent in branch_intents], ["枚举目录", "测试上传点"])
+        self.assertTrue(all(intent.to_fact_id == 1 for intent in branch_intents))
+
+    def test_reason_empty_plan_creates_fallback_intent(self) -> None:
+        project = self._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=EmptyReasoner(),  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id)
+
+        active_intents = client.project.active_intents()
+        self.assertEqual(len(active_intents), 1)
+        self.assertEqual(active_intents[0].from_fact_id, 2)
+        self.assertIn("分析下一步可验证的漏洞方向", active_intents[0].description)
+
+    def test_reason_completed_without_answer_still_completes_by_codex_judgement(self) -> None:
+        project = self._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=CompletedReasoner(),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id)
+
+        self.assertEqual(result.mode, DispatchMode.COMPLETED)
+        self.assertEqual(client.project.status, ProjectStatus.COMPLETED)
+        self.assertEqual(client.project.facts[1].description, "goal")
+
+    def test_legacy_reason_descriptions_use_leaf_fact_as_fallback(self) -> None:
+        project = self._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=LegacyReasoner(),  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id)
+
+        active_intents = client.project.active_intents()
+        self.assertEqual(len(active_intents), 1)
+        self.assertEqual(active_intents[0].from_fact_id, 2)
+        self.assertEqual(active_intents[0].description, "分析是否存在文件上传漏洞")
+
+    @staticmethod
+    def _project_ready_for_reason() -> Project:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("web service exposes upload form", fact_id=2)
+        seed_intent = project.add_intent("initial discovery", from_fact_id=0, to_fact_id=2)
+        seed_intent.mark_running()
+        seed_intent.mark_completed()
+        return project
+
+
+if __name__ == "__main__":
+    unittest.main()
