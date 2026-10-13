@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable, Mapping
@@ -18,7 +19,7 @@ from echo_agent.dispatcher.types import (
     WorkerResult,
 )
 from echo_agent.dispatcher.utils import callable_accepts_mode
-from echo_agent.models import Intent, Project, ProjectStatus
+from echo_agent.models import Intent, IntentStatus, Project, ProjectStatus
 
 
 class Dispatcher:
@@ -30,6 +31,8 @@ class Dispatcher:
         agent: AgentAdapter | None = None,
         prompt_builder: PromptBuilder | None = None,
         max_explore_workers: int = 4,
+        max_codex_slots: int = 2,
+        stop_event: threading.Event | None = None,
         codex_model: str | None = None,
         codex_mode_models: Mapping[DispatchMode | str, str] | None = None,
         codex_workspace: str = "/home/kali/workspace",
@@ -48,7 +51,13 @@ class Dispatcher:
         self.client = client
         if max_explore_workers < 1:
             raise ValueError("max_explore_workers must be at least 1")
+        if max_codex_slots < 1:
+            raise ValueError("max_codex_slots must be at least 1")
         self.max_explore_workers = max_explore_workers
+        self.max_codex_slots = max_codex_slots
+        self._model_slots = threading.BoundedSemaphore(max_codex_slots)
+        self._stop_event = stop_event or threading.Event()
+        self._state_lock = threading.Lock()
         if agent is None:
             agent = CodexDockerAgent(
                 codex_command=codex_command,
@@ -66,11 +75,18 @@ class Dispatcher:
                 stream_max_retries=codex_stream_max_retries,
                 stream_idle_timeout_ms=codex_stream_idle_timeout_ms,
             )
+        self.agent = agent
         self.worker = worker or CodexWorker(agent, prompt_builder)
         self.reasoner = reasoner or CodexReasoner(agent, prompt_builder)
         self._worker_accepts_mode = callable_accepts_mode(self.worker.execute_intent)
         self._worker_accepts_log = callable_accepts_mode(self.worker.execute_intent, parameter="log")
         self._reasoner_accepts_log = callable_accepts_mode(self.reasoner.plan, parameter="log")
+
+    def request_stop(self) -> None:
+        self._stop_event.set()
+        cancel = getattr(self.agent, "cancel_running", None)
+        if callable(cancel):
+            cancel()
 
     def run_once(self, project_id: int, release_project: bool = True) -> DispatchResult:
         project = self.client.get_project(project_id)
@@ -128,33 +144,19 @@ class Dispatcher:
         return self._reason(project, release_project=release_project)
 
     def _first_run(self, project: Project, intent: Intent, release_project: bool) -> DispatchResult:
-        intent.mark_running()
-        self.client.save_project(project)
         self._log(project.id, "first-run initial intent started", "info", {"intent_id": intent.id})
-
-        try:
-            result = self._execute_intent(project, intent, DispatchMode.FIRST_RUN)
-        except Exception as exc:
-            result = WorkerResult(
-                answer=None,
-                fact_description=self._execution_failed_fact("first-run", exc),
-            )
-            self._log(
-                project.id,
-                f"first-run initial intent failed: {type(exc).__name__}: {exc}",
-                "error",
-                {"intent_id": intent.id},
-            )
-        fact_text = self._worker_result_fact_text(result)
-        if fact_text:
-            fact = project.add_fact(fact_text)
-            self._complete_intent_with_fact(project, intent, fact.id)
-        else:
-            intent.mark_completed()
-        if release_project:
-            self._release_project(project)
-        self.client.save_project(project)
-        self._log(project.id, "first-run finished without flag", "info", {"intent_id": intent.id})
+        result = self._run_intent_with_slot(project, intent, DispatchMode.FIRST_RUN, scope="first-run")
+        with self._state_lock:
+            self._apply_intent_result(project, IntentExecutionResult(intent=intent, result=result))
+            if release_project:
+                self._release_project(project)
+            self.client.save_project(project)
+        self._log(
+            project.id,
+            "first-run finished",
+            "info" if not result.retryable else "warning",
+            {"intent_id": intent.id, "retryable": result.retryable},
+        )
         return DispatchResult(project.id, DispatchMode.FIRST_RUN, project.status, "initial intent executed")
 
     def _explore(
@@ -164,46 +166,72 @@ class Dispatcher:
         mode: DispatchMode,
         release_project: bool,
     ) -> DispatchResult:
-        for intent in intents:
-            intent.mark_running()
-        self.client.save_project(project)
         self._log(
             project.id,
             f"explore started with {len(intents)} active intents",
             "info",
-            {"intent_ids": [intent.id for intent in intents]},
+            {"intent_ids": [intent.id for intent in intents], "codex_slots": self.max_codex_slots},
         )
 
-        completed_count = 0
+        finished_count = 0
+        released_count = 0
         for item in self._execute_intents(project, intents):
-            completed_count += 1
-            self._apply_intent_result(project, item)
-            self.client.save_project(project)
+            with self._state_lock:
+                self._apply_intent_result(project, item)
+                self.client.save_project(project)
+            if item.result.retryable:
+                released_count += 1
+                level = "warning"
+                message = f"explore intent {item.intent.id} released for retry"
+            else:
+                finished_count += 1
+                level = "info"
+                message = f"explore intent {item.intent.id} finished"
             self._log(
                 project.id,
-                f"explore intent {item.intent.id} finished",
-                "info",
+                message,
+                level,
                 {
                     "intent_id": item.intent.id,
-                    "completed_count": completed_count,
+                    "finished_count": finished_count,
+                    "released_count": released_count,
                     "total_count": len(intents),
                     "has_fact": bool(item.result.fact_description),
                     "has_answer": bool(item.result.answer),
+                    "retryable": item.result.retryable,
                 },
             )
 
         if release_project:
-            self._release_project(project)
-        self.client.save_project(project)
-        self._log(project.id, f"explore finished {completed_count} intents", "info")
-        return DispatchResult(project.id, mode, project.status, f"executed {completed_count} intents")
+            with self._state_lock:
+                self._release_project(project)
+                self.client.save_project(project)
+        else:
+            self.client.save_project(project)
+        self._log(
+            project.id,
+            f"explore finished {finished_count} intents, released {released_count}",
+            "info",
+        )
+        return DispatchResult(
+            project.id,
+            mode,
+            project.status,
+            f"executed {finished_count} intents, released {released_count}",
+        )
 
     def _reason(self, project: Project, release_project: bool) -> DispatchResult:
         self._log(project.id, "reason started", "info")
-        if self._reasoner_accepts_log:
-            result = self.reasoner.plan(project, log=self._agent_log(project.id))  # type: ignore[call-arg]
-        else:
-            result = self.reasoner.plan(project)
+        if not self._acquire_model_slot():
+            self._log(project.id, "reason skipped because stop was requested", "warning")
+            return DispatchResult(project.id, DispatchMode.REASON, project.status, "reason skipped")
+        try:
+            if self._reasoner_accepts_log:
+                result = self.reasoner.plan(project, log=self._agent_log(project.id))  # type: ignore[call-arg]
+            else:
+                result = self.reasoner.plan(project)
+        finally:
+            self._model_slots.release()
         if result.completed:
             if result.answer:
                 self._set_end_fact_result(project, result.answer)
@@ -301,7 +329,13 @@ class Dispatcher:
         max_workers = min(self.max_explore_workers, len(intents))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(self._execute_intent, project, intent, DispatchMode.EXPLORE): intent
+                executor.submit(
+                    self._run_intent_with_slot,
+                    project,
+                    intent,
+                    DispatchMode.EXPLORE,
+                    f"intent {intent.id}",
+                ): intent
                 for intent in intents
             }
             for future in as_completed(futures):
@@ -309,10 +343,103 @@ class Dispatcher:
                 try:
                     result = future.result()
                 except Exception as exc:
-                    result = WorkerResult(
-                        fact_description=self._execution_failed_fact(f"intent {intent.id}", exc)
-                    )
+                    result = self._failure_result(f"intent {intent.id}", exc)
                 yield IntentExecutionResult(intent=intent, result=result)
+
+    def _run_intent_with_slot(
+        self,
+        project: Project,
+        intent: Intent,
+        mode: DispatchMode,
+        scope: str,
+    ) -> WorkerResult:
+        if self._stop_event.is_set() or not self._acquire_model_slot():
+            return WorkerResult(retryable=True)
+        try:
+            if self._stop_event.is_set():
+                return WorkerResult(retryable=True)
+            with self._state_lock:
+                intent.mark_running()
+                self.client.save_project(project)
+            return self._execute_with_retry(project, intent, mode, scope)
+        finally:
+            self._model_slots.release()
+
+    def _acquire_model_slot(self) -> bool:
+        while not self._stop_event.is_set():
+            if self._model_slots.acquire(timeout=0.2):
+                return True
+        return False
+
+    def _execute_with_retry(
+        self,
+        project: Project,
+        intent: Intent,
+        mode: DispatchMode,
+        scope: str,
+    ) -> WorkerResult:
+        try:
+            return self._execute_intent(project, intent, mode)
+        except Exception as exc:
+            if self._stop_event.is_set():
+                return WorkerResult(retryable=True)
+            if not self._is_retryable_failure(exc):
+                self._log(
+                    project.id,
+                    f"{scope} execution failed: {type(exc).__name__}: {exc}",
+                    "error",
+                    {"intent_id": intent.id},
+                )
+                return self._failure_result(scope, exc)
+            self._log(
+                project.id,
+                f"{scope} hit a retryable failure; retrying once",
+                "warning",
+                {"intent_id": intent.id, "error": str(exc)},
+            )
+            try:
+                return self._execute_intent(project, intent, mode)
+            except Exception as retry_exc:
+                if self._stop_event.is_set() or self._is_retryable_failure(retry_exc):
+                    self._log(
+                        project.id,
+                        f"{scope} retry failed; intent returned to active",
+                        "warning",
+                        {"intent_id": intent.id, "error": str(retry_exc)},
+                    )
+                    return WorkerResult(retryable=True)
+                self._log(
+                    project.id,
+                    f"{scope} retry failed: {type(retry_exc).__name__}: {retry_exc}",
+                    "error",
+                    {"intent_id": intent.id},
+                )
+                return self._failure_result(scope, retry_exc)
+
+    def _failure_result(self, scope: str, exc: Exception) -> WorkerResult:
+        if self._stop_event.is_set() or self._is_retryable_failure(exc):
+            return WorkerResult(retryable=True)
+        return WorkerResult(fact_description=self._execution_failed_fact(scope, exc))
+
+    @staticmethod
+    def _is_retryable_failure(exc: Exception) -> bool:
+        text = str(exc).lower()
+        markers = (
+            "database is locked",
+            "database locked",
+            "sqlite_busy",
+            "sqlite busy",
+            "too many requests",
+            "rate limit",
+            "ratelimit",
+            "stream idle",
+            "stream_idle",
+            "idle timeout",
+        )
+        if any(marker in text for marker in markers):
+            return True
+        tokens = text.replace(":", " ").replace(",", " ").split()
+        return "429" in tokens
 
     @staticmethod
     def _execution_failed_fact(scope: str, exc: Exception) -> str:
@@ -325,6 +452,10 @@ class Dispatcher:
 
     @staticmethod
     def _apply_intent_result(project: Project, item: IntentExecutionResult) -> None:
+        if item.result.retryable:
+            if item.intent.status == IntentStatus.RUNNING:
+                item.intent.release()
+            return
         fact_text = Dispatcher._worker_result_fact_text(item.result)
         if fact_text:
             fact = project.add_fact(fact_text)

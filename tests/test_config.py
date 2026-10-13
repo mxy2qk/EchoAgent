@@ -131,6 +131,7 @@ items = [
         )
         self.assertIsNone(settings.openai_api_key)
         self.assertEqual(settings.openai_base_url, "https://your-provider.example/v1")
+        self.assertEqual(settings.codex_max_slots, 2)
 
 
 if __name__ == "__main__":

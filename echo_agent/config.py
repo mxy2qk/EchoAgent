@@ -49,6 +49,7 @@ class DispatcherSettings:
     server_url: str
     interval_seconds: float
     explore_max_workers: int
+    codex_max_slots: int = 2
     codex_model: str | None = None
     codex_first_run_model: str | None = None
     codex_explore_model: str | None = None
@@ -95,6 +96,15 @@ class DispatcherSettings:
                     config,
                     "dispatcher",
                     "explore_max_workers",
+                )
+            ),
+            codex_max_slots=int(
+                _setting(
+                    "ECHO_AGENT_CODEX_MAX_SLOTS",
+                    config,
+                    "dispatcher",
+                    "codex_max_slots",
+                    default=2,
                 )
             ),
             codex_model=_optional_config_setting("ECHO_AGENT_CODEX_MODEL", config, "codex", "model"),

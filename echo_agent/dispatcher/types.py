@@ -19,6 +19,7 @@ class DispatchMode(str, Enum):
 class WorkerResult:
     answer: str | None = None
     fact_description: str | None = None
+    retryable: bool = False
 
     @property
     def has_answer(self) -> bool:

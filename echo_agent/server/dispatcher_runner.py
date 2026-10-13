@@ -67,17 +67,31 @@ class DispatcherRunner:
             handle = self._runs.get(project_id)
             if handle is None:
                 state = DispatcherRunState(project_id=project_id, running=False, last_message="not running")
+                dispatcher = None
+                thread = None
             else:
                 handle.stop_event.set()
                 handle.state.stop_requested = True
-                handle.state.last_message = "stop requested; docker force stop issued"
+                handle.state.last_message = "stop requested; running codex processes cancelled"
                 state = handle.state
-        self._force_stop_project(project_id)
+                dispatcher = handle.dispatcher
+                thread = handle.thread
+        if dispatcher is not None:
+            dispatcher.request_stop()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5)
+        if thread is None or not thread.is_alive():
+            self._release_idle_project(project_id)
+            state.running = False
+        else:
+            state.running = True
         return state
 
-    def _force_stop_project(self, project_id: int) -> None:
+    def _release_idle_project(self, project_id: int) -> None:
         project = self.store.get_project(project_id)
-        self.runtime.force_stop_project_container(
+        if project.status != ProjectStatus.RUNNING:
+            return
+        self.runtime.stop_project_container(
             project,
             log=lambda message, level="info", metadata=None: self.store.add_project_log(
                 project.id,
@@ -86,14 +100,13 @@ class DispatcherRunner:
                 metadata=metadata or {},
             ),
         )
-        if project.status == ProjectStatus.RUNNING:
-            project.stop()
-            self.store.add_project_log(
-                project.id,
-                "project status transition: running -> stoped",
-                metadata={"old_status": "running", "new_status": "stoped", "forced": True},
-            )
-            self.store.save_project(project)
+        project.stop()
+        self.store.add_project_log(
+            project.id,
+            "project status transition: running -> stoped",
+            metadata={"old_status": "running", "new_status": "stoped", "forced": False},
+        )
+        self.store.save_project(project)
 
     def status(self, project_id: int) -> DispatcherRunState:
         with self._lock:
@@ -117,6 +130,8 @@ class DispatcherRunner:
         dispatcher = Dispatcher(
             client,
             max_explore_workers=max_workers,
+            max_codex_slots=settings.codex_max_slots,
+            stop_event=stop_event,
             codex_model=settings.codex_model,
             codex_mode_models=settings.codex_mode_models,
             codex_workspace=settings.codex_workspace,
@@ -132,6 +147,12 @@ class DispatcherRunner:
             codex_stream_max_retries=settings.codex_stream_max_retries,
             codex_stream_idle_timeout_ms=settings.codex_stream_idle_timeout_ms,
         )
+        with self._lock:
+            handle = self._runs.get(project_id)
+            if handle is not None:
+                handle.dispatcher = dispatcher
+        if stop_event.is_set():
+            dispatcher.request_stop()
         steps = 0
         try:
             client.add_project_log(
@@ -225,3 +246,4 @@ class _RunHandle:
     thread: threading.Thread
     stop_event: threading.Event
     state: DispatcherRunState
+    dispatcher: Dispatcher | None = None

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
+import shlex
 import signal
 import subprocess
 import threading
@@ -66,6 +68,10 @@ class CodexDockerAgent:
             self._mode_key(key): int(value)
             for key, value in (mode_no_output_timeout_seconds or {}).items()
         }
+        self._preflight_lock = threading.Lock()
+        self._preflight_ready: set[str] = set()
+        self._process_lock = threading.Lock()
+        self._processes: list[subprocess.Popen[str]] = []
 
     def run(
         self,
@@ -73,18 +79,27 @@ class CodexDockerAgent:
         prompt: str,
         mode: DispatchMode,
         log: AgentLogCallback | None = None,
+        intent_id: int | None = None,
+        runtime_key: str | None = None,
     ) -> AgentRunResult:
         if not project.docker:
             raise RuntimeError("project.docker is required to run codex in explore/reason mode")
 
-        command = self._docker_command(project, mode)
+        runtime_key = self._runtime_key(intent_id=intent_id, runtime_key=runtime_key)
+        self._run_preflight(project, log=log)
+        if runtime_key is not None:
+            self._prepare_runtime(project, runtime_key, log=log)
+        command = self._docker_command(project, mode, runtime_key=runtime_key)
         env = self._subprocess_env()
+        workspace = self.workspace if runtime_key is None else self.runtime_paths(runtime_key)[1]
         self._log(
             log,
             f"codex agent process starting in {mode.value} mode",
             metadata={
                 "docker": project.docker,
-                "workspace": self.workspace,
+                "workspace": workspace,
+                "intent_id": intent_id,
+                "runtime_key": runtime_key,
                 "command": self._safe_command(command),
                 "model": self.mode_models.get(mode.value, self.model),
                 "timeout_seconds": self.timeout_seconds,
@@ -92,19 +107,100 @@ class CodexDockerAgent:
                 "prompt_chars": len(prompt),
             },
         )
-        self._run_preflight(project, log=log)
         output = self._run_process(command, prompt, mode, env=env, log=log)
         self._log(log, f"codex agent process finished in {mode.value} mode", metadata={"output_chars": len(output)})
         return AgentRunResult(output=output)
 
-    def _docker_command(self, project: Project, mode: DispatchMode) -> list[str]:
+    def intent_runtime_paths(self, intent_id: int) -> tuple[str, str]:
+        return self.runtime_paths(f"intents/{intent_id}")
+
+    def runtime_paths(self, runtime_key: str) -> tuple[str, str]:
+        root = self.workspace.rstrip("/") or "/home/kali/workspace"
+        parent = root.rsplit("/", 1)[0] if "/" in root else "/home/kali"
+        if runtime_key.startswith("intents/"):
+            intent_id = runtime_key.split("/", 1)[1]
+            return f"{parent}/.codex/intents/{intent_id}", f"{root}/intents/{intent_id}"
+        safe_key = runtime_key.strip("/") or "session"
+        return f"{parent}/.codex/{safe_key}", f"{root}/{safe_key}"
+
+    @staticmethod
+    def _runtime_key(intent_id: int | None, runtime_key: str | None) -> str | None:
+        if intent_id is not None:
+            return f"intents/{intent_id}"
+        if runtime_key:
+            return runtime_key.strip("/") or None
+        return None
+
+    def _docker_command(
+        self,
+        project: Project,
+        mode: DispatchMode,
+        runtime_key: str | None = None,
+    ) -> list[str]:
         command = ["docker", "exec", "-i"]
         if self.openai_api_key:
             command.extend(["-e", f"OPENAI_API_KEY={self.openai_api_key}"])
         if self.openai_base_url:
             command.extend(["-e", f"OPENAI_BASE_URL={self.openai_base_url}"])
-        command.extend(["-w", self.workspace, project.docker, *self._codex_command_for_mode(mode)])
+        workspace = self.workspace
+        if runtime_key is not None:
+            codex_home, workspace = self.runtime_paths(runtime_key)
+            command.extend(
+                [
+                    "-e",
+                    f"CODEX_HOME={codex_home}",
+                    "-e",
+                    f"TMUX_TMPDIR={codex_home}/tmux",
+                ]
+            )
+        command.extend(["-w", workspace, project.docker, *self._codex_command_for_mode(mode)])
         return command
+
+    def _prepare_runtime(
+        self,
+        project: Project,
+        runtime_key: str,
+        log: AgentLogCallback | None,
+    ) -> None:
+        codex_home, workspace = self.runtime_paths(runtime_key)
+        shared = self.workspace.rstrip("/") or "/home/kali/workspace"
+        script = " ".join(
+            [
+                "set -eu;",
+                "mkdir -p",
+                shlex.quote(codex_home),
+                shlex.quote(f"{codex_home}/tmux"),
+                shlex.quote(workspace),
+                ";",
+                "if [ -e",
+                shlex.quote(f"{shared}/AGENTS.md"),
+                "]; then ln -sfn",
+                shlex.quote(f"{shared}/AGENTS.md"),
+                shlex.quote(f"{workspace}/AGENTS.md"),
+                "; fi;",
+                "if [ -d",
+                shlex.quote(f"{shared}/.agents"),
+                "]; then ln -sfn",
+                shlex.quote(f"{shared}/.agents"),
+                shlex.quote(f"{workspace}/.agents"),
+                "; fi",
+            ]
+        )
+        command = ["docker", "exec", "-i", project.docker, "sh", "-lc", script]
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=self._subprocess_env(),
+        )
+        if completed.returncode != 0:
+            detail = "\n".join(
+                line for line in [completed.stdout.strip(), completed.stderr.strip()] if line
+            )
+            raise RuntimeError(f"failed to prepare codex runtime: {detail}")
+        self._log(log, "codex runtime prepared", metadata={"runtime_key": runtime_key, "workspace": workspace})
 
     def _preflight_command(self, project: Project) -> list[str]:
         command = ["docker", "exec", "-i"]
@@ -123,6 +219,14 @@ class CodexDockerAgent:
         return command
 
     def _run_preflight(self, project: Project, log: AgentLogCallback | None) -> None:
+        container = project.docker or ""
+        with self._preflight_lock:
+            if container in self._preflight_ready:
+                return
+            self._run_preflight_once(project, log)
+            self._preflight_ready.add(container)
+
+    def _run_preflight_once(self, project: Project, log: AgentLogCallback | None) -> None:
         command = self._preflight_command(project)
         self._log(log, "codex preflight started", metadata={"command": self._safe_command(command)})
         completed = subprocess.run(
@@ -171,6 +275,19 @@ class CodexDockerAgent:
             env=env,
             start_new_session=True,
         )
+        self._register_process(process)
+        try:
+            return self._consume_process(process, prompt, mode, log)
+        finally:
+            self._unregister_process(process)
+
+    def _consume_process(
+        self,
+        process: subprocess.Popen[str],
+        prompt: str,
+        mode: DispatchMode,
+        log: AgentLogCallback | None,
+    ) -> str:
         assert process.stdin is not None
         assert process.stdout is not None
         assert process.stderr is not None
@@ -394,6 +511,21 @@ class CodexDockerAgent:
     def _no_output_timeout_for_mode(self, mode: DispatchMode) -> int:
         return self.mode_no_output_timeout_seconds.get(mode.value, self.no_output_timeout_seconds)
 
+    def cancel_running(self) -> bool:
+        with self._process_lock:
+            processes = list(self._processes)
+        for process in processes:
+            self._kill_process(process)
+        return bool(processes)
+
+    def _register_process(self, process: subprocess.Popen[str]) -> None:
+        with self._process_lock:
+            self._processes.append(process)
+
+    def _unregister_process(self, process: subprocess.Popen[str]) -> None:
+        with self._process_lock:
+            self._processes = [item for item in self._processes if item is not process]
+
     @staticmethod
     def _kill_process(process: subprocess.Popen[str]) -> None:
         try:
@@ -499,8 +631,17 @@ class CodexWorker:
             prompt = self.prompt_builder.build_first_run_prompt(project, intent)
         else:
             prompt = self.prompt_builder.build_explore_prompt(project, intent)
-        result = self.agent.run(project, prompt, mode, log=log)  # type: ignore[call-arg]
+        prompt = f"{prompt}\n\n{self._isolation_note(intent.id)}"
+        result = _invoke_agent(self.agent, project, prompt, mode, log, intent_id=intent.id)
         return parse_worker_result(result.output)
+
+    @staticmethod
+    def _isolation_note(intent_id: int) -> str:
+        return (
+            f"本次执行已隔离到 intent {intent_id} 的独立工作目录和 CODEX_HOME。"
+            f"tmux 必须使用 `tmux -L intent-{intent_id}`。"
+            "产物只写当前目录。不要杀死其他进程，不要绑定固定的公共端口。"
+        )
 
 
 class CodexReasoner:
@@ -510,8 +651,36 @@ class CodexReasoner:
 
     def plan(self, project: Project, log: AgentLogCallback | None = None) -> ReasonResult:
         prompt = self.prompt_builder.build_reason_prompt(project)
-        result = self.agent.run(project, prompt, DispatchMode.REASON, log=log)  # type: ignore[call-arg]
+        prompt = (
+            f"{prompt}\n\n"
+            "本次规划使用独立 CODEX_HOME 和工作目录。"
+            "不要杀死其他进程，不要修改其他 intent 目录。"
+        )
+        result = _invoke_agent(self.agent, project, prompt, DispatchMode.REASON, log, runtime_key="reason")
         return parse_reason_result(result.output)
+
+
+
+def _invoke_agent(
+    agent: AgentAdapter,
+    project: Project,
+    prompt: str,
+    mode: DispatchMode,
+    log: AgentLogCallback | None,
+    **extra: object,
+) -> AgentRunResult:
+    run = agent.run
+    try:
+        parameters = inspect.signature(run).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    kwargs: dict[str, object] = {}
+    if "log" in parameters:
+        kwargs["log"] = log
+    for key, value in extra.items():
+        if key in parameters and value is not None:
+            kwargs[key] = value
+    return run(project, prompt, mode, **kwargs)  # type: ignore[arg-type]
 
 
 class NoopWorker:

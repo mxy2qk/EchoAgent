@@ -47,7 +47,7 @@ PROJECT_STATUS_TRANSITIONS: dict[ProjectStatus, set[ProjectStatus]] = {
 
 INTENT_STATUS_TRANSITIONS: dict[IntentStatus, set[IntentStatus]] = {
     IntentStatus.ACTIVE: {IntentStatus.RUNNING},
-    IntentStatus.RUNNING: {IntentStatus.COMPLETED},
+    IntentStatus.RUNNING: {IntentStatus.ACTIVE, IntentStatus.COMPLETED},
     IntentStatus.COMPLETED: set(),
 }
 
@@ -110,6 +110,9 @@ class Intent:
 
     def mark_running(self) -> None:
         self.transition_to(IntentStatus.RUNNING)
+
+    def release(self) -> None:
+        self.transition_to(IntentStatus.ACTIVE)
 
     def mark_completed(self, to_fact_id: int | None = None) -> None:
         if to_fact_id is not None:

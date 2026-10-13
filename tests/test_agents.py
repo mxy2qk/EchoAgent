@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import subprocess
 import unittest
+from unittest.mock import patch
 
 from echo_agent.dispatcher.agents import CodexDockerAgent
 from echo_agent.dispatcher.types import DispatchMode
@@ -135,6 +137,47 @@ class CodexDockerAgentCommandTests(unittest.TestCase):
 
         self.assertEqual(agent._no_output_timeout_for_mode(DispatchMode.EXPLORE), 1)
         self.assertEqual(agent._no_output_timeout_for_mode(DispatchMode.FIRST_RUN), 900)
+
+
+    def test_intent_command_uses_isolated_codex_home_and_workspace(self) -> None:
+        agent = CodexDockerAgent(workspace="/home/kali/workspace")
+        project = type("ProjectStub", (), {"docker": "worker-container"})()
+
+        command = agent._docker_command(project, DispatchMode.EXPLORE, runtime_key="intents/4")  # type: ignore[arg-type]
+
+        self.assertIn("CODEX_HOME=/home/kali/.codex/intents/4", command)
+        self.assertIn("TMUX_TMPDIR=/home/kali/.codex/intents/4/tmux", command)
+        self.assertIn("/home/kali/workspace/intents/4", command)
+        self.assertEqual(
+            agent.intent_runtime_paths(4),
+            ("/home/kali/.codex/intents/4", "/home/kali/workspace/intents/4"),
+        )
+
+    def test_preflight_runs_once_per_container(self) -> None:
+        agent = CodexDockerAgent()
+        project = type("ProjectStub", (), {"docker": "worker-container"})()
+        calls: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            calls.append(list(command))
+            return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+        with patch("echo_agent.dispatcher.agents.subprocess.run", fake_run):
+            agent._run_preflight(project, log=None)  # type: ignore[arg-type]
+            agent._run_preflight(project, log=None)  # type: ignore[arg-type]
+
+        self.assertEqual(len(calls), 1)
+
+    def test_cancel_running_kills_registered_process_group(self) -> None:
+        agent = CodexDockerAgent()
+        process = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        agent._register_process(process)
+
+        self.assertTrue(agent.cancel_running())
+        process.wait(timeout=2)
+
+        self.assertIsNotNone(process.returncode)
+        self.assertNotEqual(process.returncode, 0)
 
 
 if __name__ == "__main__":

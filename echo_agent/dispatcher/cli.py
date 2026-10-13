@@ -129,6 +129,7 @@ def _build_dispatcher(client: ProjectClient, args: argparse.Namespace) -> Dispat
     return Dispatcher(
         client,
         max_explore_workers=args.max_workers,
+        max_codex_slots=settings.codex_max_slots,
         codex_model=args.codex_model,
         codex_mode_models=mode_models,
         codex_workspace=settings.codex_workspace,

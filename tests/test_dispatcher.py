@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import threading
 import time
 import unittest
 from typing import Any
@@ -496,6 +497,113 @@ class DispatcherFactInsertionTests(unittest.TestCase):
         seed_intent.mark_running()
         seed_intent.mark_completed()
         return project
+
+
+class SlotGateWorker:
+    def __init__(self) -> None:
+        self.snapshot: dict[int, str] = {}
+
+    def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+        if not self.snapshot:
+            time.sleep(0.05)
+            self.snapshot = {item.id: item.status.value for item in project.intents.values()}
+        return WorkerResult(fact_description=f"fact from intent {intent.id}")
+
+
+class RetryableFailureWorker:
+    def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+        raise RuntimeError("sqlite database is locked")
+
+
+class FlakyRetryWorker:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("HTTP 429 too many requests")
+        return WorkerResult(fact_description="recovered after retry")
+
+
+class CodexSlotTests(unittest.TestCase):
+    def test_waiting_intent_stays_active_until_codex_slot_is_free(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_intent("first", from_fact_id=0, to_fact_id=1)
+        project.add_intent("second", from_fact_id=0, to_fact_id=1)
+        client = MemoryProjectClient(project)
+        worker = SlotGateWorker()
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=worker,  # type: ignore[arg-type]
+            max_explore_workers=2,
+            max_codex_slots=1,
+        )
+
+        dispatcher.run_once(project.id)
+
+        self.assertEqual(worker.snapshot[0], "running")
+        self.assertEqual(worker.snapshot[1], "active")
+        self.assertTrue(client.project.intents[0].is_completed)
+        self.assertTrue(client.project.intents[1].is_completed)
+
+    def test_retryable_failure_returns_intent_to_active_without_fact(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_intent("probe", from_fact_id=0, to_fact_id=1)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=RetryableFailureWorker(),  # type: ignore[arg-type]
+            max_codex_slots=1,
+        )
+
+        result = dispatcher.run_once(project.id)
+
+        self.assertEqual(result.mode, DispatchMode.EXPLORE)
+        self.assertEqual(client.project.intents[0].status.value, "active")
+        self.assertEqual(set(client.project.facts), {0, 1})
+        self.assertTrue(any("retry failed" in log["message"] for log in client.logs))
+
+    def test_retryable_failure_retries_once_then_completes(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_intent("probe", from_fact_id=0, to_fact_id=1)
+        client = MemoryProjectClient(project)
+        worker = FlakyRetryWorker()
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=worker,  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id)
+
+        self.assertEqual(worker.calls, 2)
+        self.assertTrue(client.project.intents[0].is_completed)
+        self.assertEqual(client.project.facts[2].description, "recovered after retry")
+
+    def test_stop_before_slot_does_not_start_intent(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_intent("probe", from_fact_id=0, to_fact_id=1)
+        client = MemoryProjectClient(project)
+        stop_event = threading.Event()
+        stop_event.set()
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("should not run"),  # type: ignore[arg-type]
+            stop_event=stop_event,
+        )
+
+        dispatcher.run_once(project.id)
+
+        self.assertEqual(client.project.intents[0].status.value, "active")
+        self.assertNotIn(2, client.project.facts)
 
 
 if __name__ == "__main__":

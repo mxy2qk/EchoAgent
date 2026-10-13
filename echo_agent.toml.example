@@ -17,8 +17,11 @@ server_url = "http://127.0.0.1:8000"
 # Delay between dispatch-loop steps.
 interval_seconds = 3.0
 
-# Max concurrent explore intents. Lower this if your model provider/proxy is unstable.
+# Orchestration concurrency. This can be higher than codex_max_slots.
 explore_max_workers = 4
+
+# Simultaneous codex exec calls. Intents without a slot stay active and do not start a process.
+codex_max_slots = 2
 
 [codex]
 # Codex CLI command executed inside the project Docker container.
