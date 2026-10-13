@@ -64,9 +64,10 @@ items = [
                 server = ServerSettings.from_env()
                 dispatcher = DispatcherSettings.from_env()
 
+        config_dir = config_path.resolve().parent
         self.assertEqual(server.host, "0.0.0.0")
         self.assertEqual(server.port, 9000)
-        self.assertEqual(server.database_path, config_path.parent / "state/test.db")
+        self.assertEqual(server.database_path, config_dir / "state/test.db")
         self.assertEqual(dispatcher.codex_command, ("codex", "exec", "--json", "-"))
         self.assertEqual(dispatcher.codex_model, "main-model")
         self.assertEqual(dispatcher.codex_mode_models["first_run"], "first-model")
@@ -81,9 +82,9 @@ items = [
         self.assertTrue(dispatcher.codex_provider_supports_websockets)
         self.assertEqual(dispatcher.codex_request_max_retries, 3)
         self.assertEqual(dispatcher.project_docker_image, "worker:test")
-        self.assertEqual(dispatcher.project_docker_context, config_path.parent / "docker-context")
-        self.assertEqual(dispatcher.project_dockerfile, config_path.parent / "docker-context/Dockerfile")
-        self.assertEqual(dispatcher.project_resource_root, config_path.parent / "state/resources")
+        self.assertEqual(dispatcher.project_docker_context, config_dir / "docker-context")
+        self.assertEqual(dispatcher.project_dockerfile, config_dir / "docker-context/Dockerfile")
+        self.assertEqual(dispatcher.project_resource_root, config_dir / "state/resources")
         self.assertEqual(len(dispatcher.project_resources), 2)
         self.assertEqual(dispatcher.project_resources[0].name, "tools")
         self.assertEqual(dispatcher.project_resources[0].container_path, "/opt/tools")
@@ -115,7 +116,10 @@ items = [
             with patch.dict(os.environ, {"ECHO_AGENT_CONFIG": str(config_path)}, clear=True):
                 settings = DispatcherSettings.from_env()
 
-        self.assertEqual(settings.project_resource_root, config_path.parent / ".echo_agent/resources")
+        self.assertEqual(
+            settings.project_resource_root,
+            config_path.resolve().parent / ".echo_agent/resources",
+        )
 
     def test_missing_user_toml_uses_example_defaults_without_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
