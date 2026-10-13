@@ -32,8 +32,6 @@ def _parse_json_object(output: str, mode: Literal["explore", "reason"]) -> dict[
     except json.JSONDecodeError:
         data = _last_json_object(output)
         if data is None:
-            if mode == "explore":
-                return {"answer": None, "fact_description": output}
             raise ValueError(f"{mode} output does not contain a JSON object")
     if not isinstance(data, dict):
         raise ValueError(f"{mode} output must be a JSON object")

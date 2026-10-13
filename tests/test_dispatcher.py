@@ -606,5 +606,112 @@ class CodexSlotTests(unittest.TestCase):
         self.assertNotIn(2, client.project.facts)
 
 
+class RaisingReasoner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def plan(self, project: Project) -> ReasonResult:
+        self.calls += 1
+        raise RuntimeError("HTTP 503 service unavailable")
+
+
+class ExplodingReasoner:
+    def plan(self, project: Project) -> ReasonResult:
+        raise AssertionError("reason should not run")
+
+
+class OuterFailureTests(unittest.TestCase):
+    def test_stranded_running_intent_is_recovered_before_reason(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        stranded = project.add_intent("probe", from_fact_id=0, to_fact_id=1)
+        stranded.mark_running()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("recovered fact"),  # type: ignore[arg-type]
+            reasoner=ExplodingReasoner(),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id, release_project=False)
+
+        self.assertEqual(result.mode, DispatchMode.EXPLORE)
+        self.assertTrue(client.project.intents[0].is_completed)
+        self.assertEqual(client.project.facts[2].description, "recovered fact")
+        self.assertTrue(any("stranded" in log["message"] for log in client.logs))
+
+    def test_retry_budget_turns_persistent_failure_into_fact(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_intent("probe", from_fact_id=0, to_fact_id=1)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=RetryableFailureWorker(),  # type: ignore[arg-type]
+            max_retryable_attempts=2,
+        )
+
+        first = dispatcher.run_once(project.id, release_project=False)
+        second = dispatcher.run_once(project.id, release_project=False)
+
+        self.assertEqual(first.mode, DispatchMode.EXPLORE)
+        self.assertEqual(client.project.intents[0].status.value, "completed")
+        self.assertIn("execution failed", client.project.facts[2].description)
+        self.assertIn("database is locked", client.project.facts[2].description)
+        self.assertEqual(second.mode, DispatchMode.EXPLORE)
+
+    def test_transient_gateway_error_is_retryable(self) -> None:
+        self.assertTrue(
+            Dispatcher._is_retryable_failure(RuntimeError("upstream returned HTTP 503 service unavailable"))
+        )
+        self.assertFalse(
+            Dispatcher._is_retryable_failure(
+                RuntimeError("codex agent no-output timed out in explore mode after 900s without stdout/stderr")
+            )
+        )
+
+    def test_reason_exception_does_not_escape_or_complete_project(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        reasoner = RaisingReasoner()
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=reasoner,  # type: ignore[arg-type]
+            max_retryable_attempts=2,
+        )
+
+        result = dispatcher.run_once(project.id, release_project=False)
+
+        self.assertEqual(result.mode, DispatchMode.REASON)
+        self.assertEqual(result.message, "reason failed; will retry")
+        self.assertEqual(client.project.status, ProjectStatus.RUNNING)
+        self.assertEqual(len(client.project.intents), 1)
+        self.assertEqual(reasoner.calls, 1)
+
+    def test_repeated_empty_reason_does_not_grow_fallback_intents(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("fallback explored"),  # type: ignore[arg-type]
+            reasoner=EmptyReasoner(),  # type: ignore[arg-type]
+            max_retryable_attempts=2,
+        )
+
+        results = dispatcher.run_loop(project.id, interval_seconds=0, max_steps=6)
+
+        fallbacks = [
+            intent
+            for intent in client.project.intents.values()
+            if "分析下一步可验证的漏洞方向" in intent.description
+        ]
+        self.assertEqual(len(fallbacks), 1)
+        self.assertEqual(results[-1].mode, DispatchMode.SKIPPED)
+        self.assertNotEqual(client.project.status, ProjectStatus.COMPLETED)
+
+
 if __name__ == "__main__":
     unittest.main()

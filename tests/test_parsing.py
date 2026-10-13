@@ -74,6 +74,10 @@ class DispatcherParsingTests(unittest.TestCase):
             ],
         )
 
+    def test_worker_output_without_json_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_worker_result("progress only, no json object")
+
 
 if __name__ == "__main__":
     unittest.main()

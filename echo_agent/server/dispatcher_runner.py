@@ -164,8 +164,19 @@ class DispatcherRunner:
                     "codex_mode_models": settings.codex_mode_models,
                 },
             )
+            consecutive_failures = 0
             while not stop_event.is_set() and (max_steps is None or steps < max_steps):
-                result = dispatcher.run_once(project_id, release_project=False)
+                try:
+                    result = dispatcher.run_once(project_id, release_project=False)
+                except Exception as exc:
+                    consecutive_failures += 1
+                    state.last_message = f"{type(exc).__name__}: {exc}"
+                    client.add_project_log(project_id, state.last_message, level="error")
+                    if consecutive_failures >= 3:
+                        break
+                    stop_event.wait(interval_seconds)
+                    continue
+                consecutive_failures = 0
                 state.last_message = result.message
                 steps += 1
                 client.add_project_log(
