@@ -108,6 +108,38 @@ def _matches_mode(value: dict[str, object], mode: Literal["explore", "reason"]) 
     return "answer" in value or "fact_description" in value
 
 
+def extract_mode_json_output(output: str, mode: Literal["explore", "reason"]) -> str | None:
+    return _last_mode_json_slice(output, mode, seen=set())
+
+
+def _last_mode_json_slice(
+    output: str,
+    mode: Literal["explore", "reason"],
+    seen: set[str],
+) -> str | None:
+    decoder = json.JSONDecoder()
+    best: str | None = None
+    for index, char in enumerate(output):
+        if char != "{":
+            continue
+        try:
+            value, end = decoder.raw_decode(output[index:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        if _matches_mode(value, mode):
+            best = output[index : index + end]
+        for nested in _event_texts(value):
+            if nested in seen:
+                continue
+            seen.add(nested)
+            found = _last_mode_json_slice(nested, mode, seen)
+            if found is not None:
+                best = found
+    return best
+
+
 def _parse_reason_intents(data: dict[str, object]) -> list[dict[str, object]]:
     raw_items = data.get("next_intents")
     if raw_items is None:

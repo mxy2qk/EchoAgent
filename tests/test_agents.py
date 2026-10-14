@@ -108,6 +108,36 @@ class CodexDockerAgentCommandTests(unittest.TestCase):
         self.assertIn('"next_intents"', output)
         self.assertTrue(any(level == "warning" and "salvaged JSON output" in message for level, message in logs))
 
+    def test_nonzero_process_salvages_json_nested_in_event_stream(self) -> None:
+        import json
+
+        message = json.dumps(
+            {"answer": None, "fact_description": "real fact", "outcome": "verified"},
+            ensure_ascii=False,
+        )
+        script = """
+import json, sys
+message = %r
+event = {"type": "item.completed", "item": {"type": "agent_message", "text": message}}
+print(json.dumps(event, ensure_ascii=False))
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1}}))
+sys.exit(1)
+""" % message
+        agent = CodexDockerAgent(timeout_seconds=5)
+        logs: list[tuple[str, str]] = []
+
+        output = agent._run_process(
+            ("python3", "-c", script),
+            prompt="hello",
+            mode=DispatchMode.EXPLORE,
+            env=None,
+            log=lambda log_message, level, _metadata: logs.append((level, log_message)),
+        )
+
+        self.assertIn("real fact", output)
+        self.assertNotIn("turn.completed", output)
+        self.assertTrue(any(level == "warning" and "salvaged JSON output" in message for level, message in logs))
+
     def test_process_is_killed_after_no_output_timeout(self) -> None:
         agent = CodexDockerAgent(timeout_seconds=10, no_output_timeout_seconds=1)
         logs: list[tuple[str, str]] = []

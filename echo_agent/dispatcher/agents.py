@@ -11,7 +11,7 @@ import time
 from collections import deque
 from typing import Mapping, Sequence
 
-from echo_agent.dispatcher.parsing import parse_reason_result, parse_worker_result
+from echo_agent.dispatcher.parsing import extract_mode_json_output, parse_reason_result, parse_worker_result
 from echo_agent.dispatcher.prompts import PromptBuilder
 from echo_agent.dispatcher.types import (
     AgentAdapter,
@@ -485,28 +485,13 @@ class CodexDockerAgent:
 
     @classmethod
     def _extract_mode_json_output(cls, text: str, mode: DispatchMode) -> str | None:
-        decoder = json.JSONDecoder()
-        best: str | None = None
-        for index, char in enumerate(text):
-            if char != "{":
-                continue
-            try:
-                value, end = decoder.raw_decode(text[index:])
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict) and cls._looks_like_mode_output(value, mode):
-                best = text[index : index + end]
-        return best
-
-    @staticmethod
-    def _looks_like_mode_output(value: dict[str, object], mode: DispatchMode) -> bool:
         if mode == DispatchMode.REASON:
-            return "completed" in value and (
-                "next_intents" in value or "next_intent_descriptions" in value
-            )
-        if mode in {DispatchMode.FIRST_RUN, DispatchMode.EXPLORE}:
-            return "answer" in value or "fact_description" in value
-        return False
+            parsed_mode = "reason"
+        elif mode in {DispatchMode.FIRST_RUN, DispatchMode.EXPLORE}:
+            parsed_mode = "explore"
+        else:
+            return None
+        return extract_mode_json_output(text, parsed_mode)
 
     def _no_output_timeout_for_mode(self, mode: DispatchMode) -> int:
         return self.mode_no_output_timeout_seconds.get(mode.value, self.no_output_timeout_seconds)

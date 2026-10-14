@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from echo_agent.dispatcher.parsing import parse_reason_result, parse_worker_result
+from echo_agent.dispatcher.parsing import extract_mode_json_output, parse_reason_result, parse_worker_result
 
 
 class DispatcherParsingTests(unittest.TestCase):
@@ -110,6 +110,54 @@ class DispatcherParsingTests(unittest.TestCase):
     def test_worker_output_without_json_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             parse_worker_result("progress only, no json object")
+
+    def test_extract_mode_json_unwraps_event_text_message_and_content(self) -> None:
+        import json
+
+        text_event = {
+            "type": "item.completed",
+            "item": {"text": json.dumps({"answer": None, "fact_description": "from text"}, ensure_ascii=False)},
+        }
+        message_event = {"message": json.dumps({"answer": None, "fact_description": "from message"}, ensure_ascii=False)}
+        content_event = {
+            "type": "response.output_text.done",
+            "content": json.dumps(
+                {"completed": False, "next_intents": [{"description": "枚举目录"}]},
+                ensure_ascii=False,
+            ),
+        }
+        explore_output = "\n".join([
+            json.dumps(text_event, ensure_ascii=False),
+            json.dumps(message_event, ensure_ascii=False),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1}}),
+        ])
+        extracted = extract_mode_json_output(explore_output, "explore")
+        self.assertIsNotNone(extracted)
+        self.assertIn("from message", extracted or "")
+        self.assertNotIn("from text", extracted or "")
+
+        reason_output = "\n".join([
+            json.dumps(content_event, ensure_ascii=False),
+            json.dumps({"type": "turn.completed"}),
+        ])
+        extracted_reason = extract_mode_json_output(reason_output, "reason")
+        self.assertIsNotNone(extracted_reason)
+        self.assertIn('"completed": false', (extracted_reason or "").lower())
+        self.assertIn("枚举目录", extracted_reason or "")
+
+    def test_extract_mode_json_prefers_later_bare_json_over_earlier_event(self) -> None:
+        import json
+
+        event = {
+            "item": {"text": json.dumps({"answer": None, "fact_description": "old"}, ensure_ascii=False)},
+        }
+        output = "\n".join([
+            json.dumps(event, ensure_ascii=False),
+            json.dumps({"answer": None, "fact_description": "new"}, ensure_ascii=False),
+        ])
+        extracted = extract_mode_json_output(output, "explore")
+        self.assertIn("new", extracted or "")
+        self.assertNotIn("old", extracted or "")
 
 
 if __name__ == "__main__":
