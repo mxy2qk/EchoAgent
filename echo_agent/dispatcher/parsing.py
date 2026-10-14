@@ -8,17 +8,25 @@ from echo_agent.dispatcher.types import ReasonResult, WorkerResult
 
 def parse_worker_result(output: str) -> WorkerResult:
     data = _parse_json_object(output, mode="explore")
+    fact_description = _optional_fact_description(data.get("fact_description"))
+    answer = _optional_answer(data.get("answer"))
+    if answer is None and fact_description is None and "outcome" not in data:
+        return WorkerResult()
     return WorkerResult(
-        answer=_optional_answer(data.get("answer")),
-        fact_description=_optional_fact_description(data.get("fact_description")),
+        answer=answer,
+        fact_description=fact_description,
+        outcome=_optional_worker_outcome(data.get("outcome")),
     )
 
 
 def parse_reason_result(output: str) -> ReasonResult:
     data = _parse_json_object(output, mode="reason")
+    completed = data.get("completed", False)
+    if not isinstance(completed, bool):
+        raise ValueError("reason output completed must be a boolean")
     intents = _parse_reason_intents(data)
     return ReasonResult(
-        completed=bool(data.get("completed", False)),
+        completed=completed,
         next_intent_descriptions=[str(item["description"]) for item in intents],
         next_intents=intents,
         answer=_optional_answer(data.get("answer")),
@@ -27,20 +35,26 @@ def parse_reason_result(output: str) -> ReasonResult:
 
 
 def _parse_json_object(output: str, mode: Literal["explore", "reason"]) -> dict[str, object]:
-    try:
-        data = json.loads(output)
-    except json.JSONDecodeError:
-        data = _last_json_object(output)
-        if data is None:
-            raise ValueError(f"{mode} output does not contain a JSON object")
+    matches = _matching_json_objects(output, mode)
+    if not matches:
+        raise ValueError(f"{mode} output does not contain a JSON object")
+    data = matches[-1]
     if not isinstance(data, dict):
         raise ValueError(f"{mode} output must be a JSON object")
     return data
 
 
-def _last_json_object(output: str) -> dict[str, object] | None:
+def _matching_json_objects(output: str, mode: Literal["explore", "reason"]) -> list[dict[str, object]]:
+    matches: list[dict[str, object]] = []
+    for text in _candidate_texts(output):
+        matches.extend(_scan_matching_objects(text, mode))
+    return matches
+
+
+def _candidate_texts(output: str) -> list[str]:
+    texts = [output]
     decoder = json.JSONDecoder()
-    last_object: dict[str, object] | None = None
+    seen: set[str] = set()
     for index, char in enumerate(output):
         if char != "{":
             continue
@@ -48,9 +62,50 @@ def _last_json_object(output: str) -> dict[str, object] | None:
             value, _ = decoder.raw_decode(output[index:])
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict):
-            last_object = value
-    return last_object
+        if not isinstance(value, dict):
+            continue
+        for text in _event_texts(value):
+            if text not in seen:
+                seen.add(text)
+                texts.append(text)
+    return texts
+
+
+def _event_texts(value: dict[str, object]) -> list[str]:
+    texts: list[str] = []
+    item = value.get("item")
+    containers: list[dict[str, object]] = [value]
+    if isinstance(item, dict):
+        containers.append(item)
+    for container in containers:
+        for key in ("text", "message", "content"):
+            nested = container.get(key)
+            if isinstance(nested, str) and nested.strip():
+                texts.append(nested)
+    return texts
+
+
+def _scan_matching_objects(output: str, mode: Literal["explore", "reason"]) -> list[dict[str, object]]:
+    decoder = json.JSONDecoder()
+    matches: list[dict[str, object]] = []
+    for index, char in enumerate(output):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(output[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and _matches_mode(value, mode):
+            matches.append(value)
+    return matches
+
+
+def _matches_mode(value: dict[str, object], mode: Literal["explore", "reason"]) -> bool:
+    if mode == "reason":
+        return "completed" in value and (
+            "next_intents" in value or "next_intent_descriptions" in value
+        )
+    return "answer" in value or "fact_description" in value
 
 
 def _parse_reason_intents(data: dict[str, object]) -> list[dict[str, object]]:
@@ -85,9 +140,9 @@ def _parse_reason_intents(data: dict[str, object]) -> list[dict[str, object]]:
 def _optional_int(value: object) -> int | None:
     if value is None:
         return None
-    if isinstance(value, bool):
-        raise ValueError("integer field cannot be boolean")
-    return int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("integer field must be an integer or null")
+    return value
 
 
 def _optional_str(value: object) -> str | None:
@@ -102,6 +157,15 @@ def _optional_answer(value: object) -> str | None:
     if text in {"真实 flag 字符串", "实际获得的完整 flag", "实际获得的完整 flag；不要照抄本句", "最终答案", "answer"}:
         return None
     return text
+
+
+def _optional_worker_outcome(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"verified", "refuted"}:
+        return text
+    raise ValueError("worker output outcome must be verified or refuted")
 
 
 def _optional_fact_description(value: object) -> str | None:

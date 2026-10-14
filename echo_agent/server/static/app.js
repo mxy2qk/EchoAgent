@@ -226,7 +226,7 @@ function drawGraph(project) {
       state.selectedIntentId = null;
       drawGraph(project);
       renderGraphDetail(project);
-    }));
+    }, fact.kind || "evidence"));
   }
 
   for (const intent of intents) {
@@ -475,11 +475,11 @@ function groupFactsByDepth(facts, intents) {
     .map(([, columnFacts]) => columnFacts.sort((left, right) => left.id - right.id));
 }
 
-function node(x, y, title, description, selected = false, onClick = null) {
+function node(x, y, title, description, selected = false, onClick = null, kind = "evidence") {
   const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
-  group.classList.add("graph-node", "fact-node");
-  if (title === "F0") group.classList.add("start-fact");
-  if (title === "F1") group.classList.add("goal-fact");
+  group.classList.add("graph-node", "fact-node", `fact-${kind || "evidence"}`);
+  if (title === "F0" || kind === "start") group.classList.add("start-fact");
+  if (title === "F1" || kind === "goal") group.classList.add("goal-fact");
   if (selected) group.classList.add("selected");
   group.setAttribute("tabindex", "0");
   group.setAttribute("role", "button");
@@ -720,12 +720,14 @@ function label(x, y, text, selected = false, onClick = null, intent = null) {
 function statusColor(status) {
   if (status === "completed") return "#137333";
   if (status === "running") return "#8a5a00";
+  if (status === "failed") return "#b42318";
   return "#006d77";
 }
 
 function colorName(color) {
   if (color === "#137333") return "completed";
   if (color === "#8a5a00") return "running";
+  if (color === "#b42318") return "failed";
   return "active";
 }
 
@@ -735,6 +737,7 @@ function graphDefs() {
     ["active", "#006d77"],
     ["completed", "#137333"],
     ["running", "#8a5a00"],
+    ["failed", "#b42318"],
   ]) {
     const marker = svgElement("marker", {
       id: `arrow-${name}`,
@@ -784,6 +787,7 @@ function renderGraphDetail(project) {
   detail.innerHTML = `
     <div class="graph-detail-header">
       <strong>Fact #${escapeHtml(fact.id)}</strong>
+      <span class="badge ${escapeHtml(fact.kind || "evidence")}">${escapeHtml(fact.kind || "evidence")}</span>
       <button type="button" class="ghost-button" id="clear-graph-selection">关闭</button>
     </div>
     <p>${escapeHtml(fact.description)}</p>
@@ -803,9 +807,11 @@ function renderIntentDetail(project, intent, detail) {
     <div class="graph-detail-header">
       <strong>Intent #${escapeHtml(intent.id)}</strong>
       <span class="badge ${escapeHtml(intent.status)}">${escapeHtml(intent.status)}</span>
+      <span class="badge ${escapeHtml(intent.outcome || "pending")}">${escapeHtml(intent.outcome || "pending")}</span>
       <button type="button" class="ghost-button" id="clear-graph-selection">关闭</button>
     </div>
     <p>${escapeHtml(intent.description || "无描述")}</p>
+    ${intent.note ? `<p class="intent-note">${escapeHtml(intent.note)}</p>` : ""}
     <div class="graph-links">
       ${renderFactEndpoint("From", intent.from, fromFact)}
       ${renderFactEndpoint("To", intent.to, toFact)}
@@ -840,7 +846,8 @@ function renderIntentSummary(title, intents) {
   }
   const items = intents.map((intent) => {
     const description = trimText(intent.description || "无描述", 80);
-    return `<li>#${escapeHtml(intent.id)} · ${escapeHtml(intent.status)} · ${escapeHtml(description)}</li>`;
+    const outcome = intent.outcome ? ` · ${intent.outcome}` : "";
+    return `<li>#${escapeHtml(intent.id)} · ${escapeHtml(intent.status)}${escapeHtml(outcome)} · ${escapeHtml(description)}</li>`;
   }).join("");
   return `<div><span>${escapeHtml(title)}</span><ul>${items}</ul></div>`;
 }

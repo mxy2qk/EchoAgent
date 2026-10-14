@@ -8,7 +8,7 @@ from typing import Any
 
 from echo_agent.dispatcher.core import Dispatcher
 from echo_agent.dispatcher.types import DispatchMode, ReasonResult, WorkerResult
-from echo_agent.models import Project, ProjectStatus
+from echo_agent.models import FactKind, IntentOutcome, Project, ProjectStatus
 
 
 class MemoryProjectClient:
@@ -174,9 +174,11 @@ class DispatcherFactInsertionTests(unittest.TestCase):
 
         saved = client.project
         self.assertEqual(result.mode, DispatchMode.FIRST_RUN)
-        self.assertIn("first-run execution failed", saved.facts[2].description)
-        self.assertEqual(saved.intents[0].to_fact_id, 2)
-        self.assertTrue(saved.intents[0].is_completed)
+        self.assertNotIn(2, saved.facts)
+        self.assertEqual(saved.intents[0].status.value, "failed")
+        self.assertEqual(saved.intents[0].outcome.value, "error")
+        self.assertEqual(saved.intents[0].from_fact_id, 0)
+        self.assertIn("first-run execution failed", saved.intents[0].note)
         self.assertEqual(saved.status, ProjectStatus.STOPED)
 
     def test_no_output_timeout_failure_fact_is_actionable(self) -> None:
@@ -352,7 +354,7 @@ class DispatcherFactInsertionTests(unittest.TestCase):
         self.assertEqual(client.project.facts[1].description, "goal")
         self.assertTrue(client.project.intents[0].is_completed)
 
-    def test_reason_completed_updates_end_fact_to_result(self) -> None:
+    def test_reason_completion_requires_answer_in_evidence(self) -> None:
         project = self._project_ready_for_reason()
         client = MemoryProjectClient(project)
         dispatcher = Dispatcher(
@@ -363,10 +365,11 @@ class DispatcherFactInsertionTests(unittest.TestCase):
 
         result = dispatcher.run_once(project.id)
 
-        self.assertEqual(result.mode, DispatchMode.COMPLETED)
-        self.assertEqual(client.project.facts[1].description, "result\nanswer: flag{reason}")
+        self.assertEqual(result.mode, DispatchMode.REASON)
+        self.assertEqual(client.project.facts[1].description, "goal")
+        self.assertNotEqual(client.project.status, ProjectStatus.COMPLETED)
         self.assertFalse(
-            any(intent.to_fact_id == 1 and intent.description == "确认该事实包含最终答案" for intent in client.project.intents.values())
+            any(intent.description == "确认该事实包含最终答案" for intent in client.project.intents.values())
         )
 
     def test_existing_graph_answer_only_completes_after_reason_judgement(self) -> None:
@@ -467,8 +470,8 @@ class DispatcherFactInsertionTests(unittest.TestCase):
 
         result = dispatcher.run_once(project.id)
 
-        self.assertEqual(result.mode, DispatchMode.COMPLETED)
-        self.assertEqual(client.project.status, ProjectStatus.COMPLETED)
+        self.assertEqual(result.mode, DispatchMode.REASON)
+        self.assertNotEqual(client.project.status, ProjectStatus.COMPLETED)
         self.assertEqual(client.project.facts[1].description, "goal")
 
     def test_legacy_reason_descriptions_use_leaf_fact_as_fallback(self) -> None:
@@ -657,10 +660,12 @@ class OuterFailureTests(unittest.TestCase):
         second = dispatcher.run_once(project.id, release_project=False)
 
         self.assertEqual(first.mode, DispatchMode.EXPLORE)
-        self.assertEqual(client.project.intents[0].status.value, "completed")
-        self.assertIn("execution failed", client.project.facts[2].description)
-        self.assertIn("database is locked", client.project.facts[2].description)
         self.assertEqual(second.mode, DispatchMode.EXPLORE)
+        self.assertEqual(client.project.intents[0].status.value, "failed")
+        self.assertEqual(client.project.intents[0].outcome.value, "error")
+        self.assertNotIn(2, client.project.facts)
+        self.assertIn("database is locked", client.project.intents[0].note)
+        self.assertIn("execution failed", client.project.intents[0].note)
 
     def test_transient_gateway_error_is_retryable(self) -> None:
         self.assertTrue(
@@ -711,6 +716,59 @@ class OuterFailureTests(unittest.TestCase):
         self.assertEqual(len(fallbacks), 1)
         self.assertEqual(results[-1].mode, DispatchMode.SKIPPED)
         self.assertNotEqual(client.project.status, ProjectStatus.COMPLETED)
+
+
+class RefutedWorker:
+    def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+        return WorkerResult(fact_description="上传点不存在可利用漏洞", outcome="refuted")
+
+
+class GraphContractTests(unittest.TestCase):
+    def test_refuted_path_does_not_become_next_from(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("发现上传点", fact_id=2)
+        project.add_intent("分析上传", from_fact_id=2, to_fact_id=1)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=RefutedWorker(),  # type: ignore[arg-type]
+            reasoner=EmptyReasoner(),  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id, release_project=False)
+        dispatcher.run_once(project.id, release_project=False)
+
+        saved = client.project
+        self.assertEqual(saved.facts[3].kind, FactKind.REFUTED)
+        self.assertEqual(saved.intents[0].outcome, IntentOutcome.REFUTED)
+        self.assertTrue(saved.intents[0].is_completed)
+        fallback = saved.active_intents()[0]
+        self.assertEqual(fallback.from_fact_id, 2)
+        self.assertNotEqual(fallback.from_fact_id, 3)
+
+    def test_completed_description_is_not_planned_again(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        done = project.add_intent("分析是否存在文件上传漏洞", from_fact_id=2, to_fact_id=1)
+        done.mark_running()
+        done.mark_completed()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=LegacyReasoner(),  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id)
+
+        matches = [
+            intent
+            for intent in client.project.intents.values()
+            if intent.description == "分析是否存在文件上传漏洞"
+        ]
+        self.assertEqual(len(matches), 1)
+
 
 
 if __name__ == "__main__":

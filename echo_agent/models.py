@@ -29,12 +29,45 @@ class IntentStatus(str, Enum):
     ACTIVE = "active"
     RUNNING = "running"
     COMPLETED = "completed"
+    FAILED = "failed"
 
     @classmethod
     def coerce(cls, value: str | "IntentStatus") -> "IntentStatus":
         if isinstance(value, cls):
             return value
         return cls(value)
+
+
+class FactKind(str, Enum):
+    START = "start"
+    GOAL = "goal"
+    EVIDENCE = "evidence"
+    REFUTED = "refuted"
+    ERROR = "error"
+
+    @classmethod
+    def coerce(cls, value: str | "FactKind" | None) -> "FactKind":
+        if isinstance(value, cls):
+            return value
+        if value is None or not str(value).strip():
+            return cls.EVIDENCE
+        return cls(str(value))
+
+
+class IntentOutcome(str, Enum):
+    PENDING = "pending"
+    VERIFIED = "verified"
+    REFUTED = "refuted"
+    ERROR = "error"
+    EMPTY = "empty"
+
+    @classmethod
+    def coerce(cls, value: str | "IntentOutcome" | None) -> "IntentOutcome":
+        if isinstance(value, cls):
+            return value
+        if value is None or not str(value).strip():
+            return cls.PENDING
+        return cls(str(value))
 
 
 PROJECT_STATUS_TRANSITIONS: dict[ProjectStatus, set[ProjectStatus]] = {
@@ -47,8 +80,9 @@ PROJECT_STATUS_TRANSITIONS: dict[ProjectStatus, set[ProjectStatus]] = {
 
 INTENT_STATUS_TRANSITIONS: dict[IntentStatus, set[IntentStatus]] = {
     IntentStatus.ACTIVE: {IntentStatus.RUNNING},
-    IntentStatus.RUNNING: {IntentStatus.ACTIVE, IntentStatus.COMPLETED},
+    IntentStatus.RUNNING: {IntentStatus.ACTIVE, IntentStatus.COMPLETED, IntentStatus.FAILED},
     IntentStatus.COMPLETED: set(),
+    IntentStatus.FAILED: set(),
 }
 
 
@@ -56,22 +90,33 @@ INTENT_STATUS_TRANSITIONS: dict[IntentStatus, set[IntentStatus]] = {
 class Fact:
     id: int
     description: str
+    kind: FactKind = FactKind.EVIDENCE
 
     def __post_init__(self) -> None:
         if self.id < 0:
             raise ValueError("fact id must be non-negative")
         if not self.description.strip():
             raise ValueError("fact description cannot be empty")
+        self.kind = FactKind.coerce(self.kind)
+
+    @property
+    def is_plannable(self) -> bool:
+        return self.kind in {FactKind.START, FactKind.EVIDENCE}
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "description": self.description,
+            "kind": self.kind.value,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Fact":
-        return cls(id=int(data["id"]), description=str(data["description"]))
+        return cls(
+            id=int(data["id"]),
+            description=str(data["description"]),
+            kind=FactKind.coerce(data.get("kind")),
+        )
 
 
 @dataclass(slots=True)
@@ -81,6 +126,8 @@ class Intent:
     to_fact_id: int | None = None
     description: str = ""
     status: IntentStatus = IntentStatus.ACTIVE
+    outcome: IntentOutcome = IntentOutcome.PENDING
+    note: str = ""
 
     def __post_init__(self) -> None:
         if self.id < 0:
@@ -90,6 +137,8 @@ class Intent:
         if self.to_fact_id is not None and self.to_fact_id < 0:
             raise ValueError("intent to_fact_id must be non-negative")
         self.status = IntentStatus.coerce(self.status)
+        self.outcome = IntentOutcome.coerce(self.outcome)
+        self.note = str(self.note or "")
 
     @property
     def is_executable(self) -> bool:
@@ -114,12 +163,23 @@ class Intent:
     def release(self) -> None:
         self.transition_to(IntentStatus.ACTIVE)
 
-    def mark_completed(self, to_fact_id: int | None = None) -> None:
+    def mark_completed(
+        self,
+        to_fact_id: int | None = None,
+        outcome: IntentOutcome | str = IntentOutcome.VERIFIED,
+    ) -> None:
         if to_fact_id is not None:
             if to_fact_id < 0:
                 raise ValueError("intent to_fact_id must be non-negative")
             self.to_fact_id = to_fact_id
+        self.outcome = IntentOutcome.coerce(outcome)
         self.transition_to(IntentStatus.COMPLETED)
+
+    def mark_failed(self, outcome: IntentOutcome | str, note: str = "") -> None:
+        self.outcome = IntentOutcome.coerce(outcome)
+        if note:
+            self.note = note
+        self.transition_to(IntentStatus.FAILED)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -128,6 +188,8 @@ class Intent:
             "to": self.to_fact_id,
             "description": self.description,
             "status": self.status.value,
+            "outcome": self.outcome.value,
+            "note": self.note,
         }
 
     @classmethod
@@ -138,6 +200,8 @@ class Intent:
             to_fact_id=data.get("to"),
             description=str(data.get("description", "")),
             status=IntentStatus.coerce(data.get("status", IntentStatus.ACTIVE)),
+            outcome=IntentOutcome.coerce(data.get("outcome")),
+            note=str(data.get("note", "")),
         )
 
 
@@ -210,11 +274,21 @@ class Project:
     def complete(self) -> None:
         self.transition_to(ProjectStatus.COMPLETED)
 
-    def add_fact(self, description: str, fact_id: int | None = None) -> Fact:
+    def add_fact(
+        self,
+        description: str,
+        fact_id: int | None = None,
+        kind: FactKind | str | None = None,
+    ) -> Fact:
         next_id = self._next_id(self.facts) if fact_id is None else fact_id
         if next_id in self.facts:
             raise ValueError(f"fact id already exists: {next_id}")
-        fact = Fact(id=next_id, description=description)
+        resolved_kind = FactKind.coerce(kind)
+        if kind is None and next_id == 0:
+            resolved_kind = FactKind.START
+        elif kind is None and next_id == 1:
+            resolved_kind = FactKind.GOAL
+        fact = Fact(id=next_id, description=description, kind=resolved_kind)
         self.facts[fact.id] = fact
         return fact
 
@@ -253,10 +327,10 @@ class Project:
         if intent.status == IntentStatus.ACTIVE:
             intent.mark_running()
         if result_fact_description is not None:
-            fact = self.add_fact(result_fact_description)
-            intent.mark_completed(to_fact_id=fact.id)
+            fact = self.add_fact(result_fact_description, kind=FactKind.EVIDENCE)
+            intent.mark_completed(to_fact_id=fact.id, outcome=IntentOutcome.VERIFIED)
         else:
-            intent.mark_completed()
+            intent.mark_completed(outcome=IntentOutcome.VERIFIED)
         return intent
 
     def to_dict(self) -> dict[str, Any]:

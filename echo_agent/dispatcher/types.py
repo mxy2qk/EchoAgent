@@ -21,6 +21,7 @@ class WorkerResult:
     fact_description: str | None = None
     retryable: bool = False
     detail: str | None = None
+    outcome: str | None = None
 
     @property
     def has_answer(self) -> bool:

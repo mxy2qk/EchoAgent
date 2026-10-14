@@ -39,6 +39,7 @@ class SQLiteProjectStore:
                     project_id INTEGER NOT NULL,
                     id INTEGER NOT NULL,
                     description TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'evidence',
                     PRIMARY KEY (project_id, id),
                     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
                 );
@@ -50,6 +51,8 @@ class SQLiteProjectStore:
                     to_fact_id INTEGER,
                     description TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    outcome TEXT NOT NULL DEFAULT 'pending',
+                    note TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (project_id, id),
                     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
                     FOREIGN KEY (project_id, from_fact_id) REFERENCES facts(project_id, id),
@@ -68,6 +71,7 @@ class SQLiteProjectStore:
                 """
             )
             self._ensure_project_columns(conn)
+            self._ensure_graph_columns(conn)
 
     def list_projects(self) -> list[Project]:
         with self._connect() as conn:
@@ -85,7 +89,7 @@ class SQLiteProjectStore:
 
             fact_rows = conn.execute(
                 """
-                SELECT id, description
+                SELECT id, description, kind
                 FROM facts
                 WHERE project_id = ?
                 ORDER BY id
@@ -94,7 +98,7 @@ class SQLiteProjectStore:
             ).fetchall()
             intent_rows = conn.execute(
                 """
-                SELECT id, from_fact_id, to_fact_id, description, status
+                SELECT id, from_fact_id, to_fact_id, description, status, outcome, note
                 FROM intents
                 WHERE project_id = ?
                 ORDER BY id
@@ -103,7 +107,11 @@ class SQLiteProjectStore:
             ).fetchall()
 
         facts = {
-            int(row["id"]): Fact(id=int(row["id"]), description=str(row["description"]))
+            int(row["id"]): Fact(
+                id=int(row["id"]),
+                description=str(row["description"]),
+                kind=str(row["kind"]),
+            )
             for row in fact_rows
         }
         intents = {
@@ -113,6 +121,8 @@ class SQLiteProjectStore:
                 to_fact_id=_nullable_int(row["to_fact_id"]),
                 description=str(row["description"]),
                 status=str(row["status"]),
+                outcome=str(row["outcome"]),
+                note=str(row["note"] or ""),
             )
             for row in intent_rows
         }
@@ -299,13 +309,26 @@ class SQLiteProjectStore:
                 conn.execute(statement)
 
     @staticmethod
+    def _ensure_graph_columns(conn: sqlite3.Connection) -> None:
+        fact_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(facts)").fetchall()}
+        if "kind" not in fact_columns:
+            conn.execute("ALTER TABLE facts ADD COLUMN kind TEXT NOT NULL DEFAULT 'evidence'")
+            conn.execute("UPDATE facts SET kind = 'start' WHERE id = 0")
+            conn.execute("UPDATE facts SET kind = 'goal' WHERE id = 1")
+        intent_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(intents)").fetchall()}
+        if "outcome" not in intent_columns:
+            conn.execute("ALTER TABLE intents ADD COLUMN outcome TEXT NOT NULL DEFAULT 'pending'")
+        if "note" not in intent_columns:
+            conn.execute("ALTER TABLE intents ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+
+    @staticmethod
     def _insert_facts(conn: sqlite3.Connection, project_id: int, facts: Iterable[Fact]) -> None:
         conn.executemany(
             """
-            INSERT INTO facts (project_id, id, description)
-            VALUES (?, ?, ?)
+            INSERT INTO facts (project_id, id, description, kind)
+            VALUES (?, ?, ?, ?)
             """,
-            ((project_id, fact.id, fact.description) for fact in facts),
+            ((project_id, fact.id, fact.description, fact.kind.value) for fact in facts),
         )
 
     @staticmethod
@@ -324,12 +347,12 @@ class SQLiteProjectStore:
         ]
         conn.executemany(
             """
-            INSERT OR IGNORE INTO facts (project_id, id, description)
-            VALUES (?, ?, ?)
+            INSERT OR IGNORE INTO facts (project_id, id, description, kind)
+            VALUES (?, ?, ?, ?)
             """,
             [
-                (project_id, 0, "start"),
-                (project_id, 1, "\n".join(goal_parts)),
+                (project_id, 0, "start", "start"),
+                (project_id, 1, "\n".join(goal_parts), "goal"),
             ],
         )
 
@@ -337,8 +360,10 @@ class SQLiteProjectStore:
     def _insert_intents(conn: sqlite3.Connection, project_id: int, intents: Iterable[Intent]) -> None:
         conn.executemany(
             """
-            INSERT INTO intents (project_id, id, from_fact_id, to_fact_id, description, status)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO intents (
+                project_id, id, from_fact_id, to_fact_id, description, status, outcome, note
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 (
@@ -348,6 +373,8 @@ class SQLiteProjectStore:
                     intent.to_fact_id,
                     intent.description,
                     intent.status.value,
+                    intent.outcome.value,
+                    intent.note,
                 )
                 for intent in intents
             ),

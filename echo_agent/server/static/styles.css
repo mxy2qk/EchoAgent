@@ -230,8 +230,23 @@ button.danger:disabled {
 }
 
 .badge.active,
-.badge.stoped {
+.badge.stoped,
+.badge.evidence,
+.badge.start,
+.badge.pending,
+.badge.verified {
   background: var(--accent);
+}
+
+.badge.failed,
+.badge.error,
+.badge.refuted {
+  background: var(--danger);
+}
+
+.badge.empty,
+.badge.goal {
+  background: var(--muted);
 }
 
 .summary-row {
@@ -363,6 +378,12 @@ button.danger:disabled {
   stroke: #2e7d32;
 }
 
+.fact-node.fact-refuted rect,
+.fact-node.fact-error rect {
+  fill: #fff6f5;
+  stroke: var(--danger);
+}
+
 .fact-node.selected rect {
   fill: #edfafa;
   stroke: #004f58;
@@ -402,6 +423,11 @@ button.danger:disabled {
 .intent-node.intent-active rect {
   fill: #eefafa;
   stroke: var(--accent);
+}
+
+.intent-node.intent-failed rect {
+  fill: #fff6f5;
+  stroke: var(--danger);
 }
 
 .intent-node.selected rect {
@@ -503,6 +529,10 @@ button.danger:disabled {
   line-height: 1.45;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.graph-detail .intent-note {
+  color: var(--danger);
 }
 
 .graph-links {

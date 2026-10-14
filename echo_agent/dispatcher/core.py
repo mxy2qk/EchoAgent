@@ -20,7 +20,7 @@ from echo_agent.dispatcher.types import (
     WorkerResult,
 )
 from echo_agent.dispatcher.utils import callable_accepts_mode
-from echo_agent.models import Intent, IntentStatus, Project, ProjectStatus
+from echo_agent.models import FactKind, Intent, IntentOutcome, IntentStatus, Project, ProjectStatus
 
 
 class Dispatcher:
@@ -280,14 +280,20 @@ class Dispatcher:
                     project.status,
                     "reason completion deferred",
                 )
-            if result.answer:
+            if result.answer and self._answer_in_evidence(project, result.answer):
                 self._set_end_fact_result(project, result.answer)
                 self._connect_answer_fact_to_goal(project, result.answer)
-            self._complete_project(project)
-            self._no_progress_reasons = 0
-            self.client.save_project(project)
-            self._log(project.id, "reason marked project completed", "success", {"has_answer": bool(result.answer)})
-            return DispatchResult(project.id, DispatchMode.COMPLETED, project.status, "reason marked project completed")
+                self._complete_project(project)
+                self._no_progress_reasons = 0
+                self.client.save_project(project)
+                self._log(project.id, "reason marked project completed", "success", {"has_answer": True})
+                return DispatchResult(project.id, DispatchMode.COMPLETED, project.status, "reason marked project completed")
+            self._log(
+                project.id,
+                "reason completion rejected because the answer is not in evidence",
+                "warning",
+                {"has_answer": bool(result.answer)},
+            )
 
         planned_intents = self._planned_intents_from_reason_result(project, result)
         planned_count = 0
@@ -295,10 +301,16 @@ class Dispatcher:
             description = str(item.get("description", "")).strip()
             if not description:
                 continue
-            from_fact_id = self._valid_fact_id(project, item.get("from"))
+            from_fact_id = self._plannable_fact_id(project, item.get("from"))
+            if from_fact_id is None:
+                from_fact_id = self._select_reason_fallback_fact_id(project)
             to_fact_id = self._valid_fact_id(project, item.get("to"))
+            if to_fact_id is not None and not self._is_goal_or_evidence(project, to_fact_id):
+                to_fact_id = None
             if to_fact_id is None and 1 in project.facts:
                 to_fact_id = 1
+            if from_fact_id is None:
+                continue
             if self._is_duplicate_intent(project, description, from_fact_id):
                 continue
             project.add_intent(
@@ -364,15 +376,57 @@ class Dispatcher:
 
     @staticmethod
     def _select_reason_fallback_fact_id(project: Project) -> int | None:
-        if not project.facts:
+        closed = [
+            intent
+            for intent in project.intents.values()
+            if intent.outcome in {IntentOutcome.ERROR, IntentOutcome.EMPTY, IntentOutcome.REFUTED}
+        ]
+        if closed:
+            latest = max(closed, key=lambda item: item.id)
+            source = project.facts.get(latest.from_fact_id) if latest.from_fact_id is not None else None
+            if source is not None and source.is_plannable:
+                return source.id
+        candidates = [
+            fact_id
+            for fact_id, fact in project.facts.items()
+            if fact.is_plannable and fact_id != 1
+        ]
+        if not candidates:
             return None
-        from_fact_ids = {intent.from_fact_id for intent in project.intents.values() if intent.from_fact_id is not None}
-        candidate_ids = sorted(fact_id for fact_id in project.facts if fact_id not in from_fact_ids and fact_id != 1)
-        if candidate_ids:
-            return candidate_ids[-1]
-        if 1 in project.facts and len(project.facts) > 1:
-            return max(fact_id for fact_id in project.facts if fact_id != 1)
-        return max(project.facts)
+        from_fact_ids = {
+            intent.from_fact_id for intent in project.intents.values() if intent.from_fact_id is not None
+        }
+        unused = sorted(fact_id for fact_id in candidates if fact_id not in from_fact_ids)
+        if unused:
+            return unused[-1]
+        return max(candidates)
+
+    @staticmethod
+    def _plannable_fact_id(project: Project, value: object) -> int | None:
+        fact_id = Dispatcher._valid_fact_id(project, value)
+        if fact_id is None:
+            return None
+        fact = project.facts.get(fact_id)
+        if fact is None or not fact.is_plannable:
+            return None
+        return fact_id
+
+    @staticmethod
+    def _is_goal_or_evidence(project: Project, fact_id: int) -> bool:
+        fact = project.facts.get(fact_id)
+        if fact is None:
+            return False
+        return fact.kind in {FactKind.GOAL, FactKind.EVIDENCE}
+
+    @staticmethod
+    def _answer_in_evidence(project: Project, answer: str) -> bool:
+        text = answer.strip()
+        if not text:
+            return False
+        return any(
+            fact.kind == FactKind.EVIDENCE and text in fact.description
+            for fact in project.facts.values()
+        )
 
     @staticmethod
     def _fallback_reason_intent_description(project: Project, from_fact_id: int | None) -> str:
@@ -482,7 +536,7 @@ class Dispatcher:
     def _failure_result(self, scope: str, exc: Exception) -> WorkerResult:
         if self._stop_event.is_set() or self._is_retryable_failure(exc):
             return WorkerResult(retryable=True, detail=str(exc))
-        return WorkerResult(fact_description=self._execution_failed_fact(scope, exc))
+        return WorkerResult(outcome="error", detail=self._execution_failed_fact(scope, exc))
 
     @staticmethod
     def _is_retryable_failure(exc: Exception) -> bool:
@@ -521,16 +575,32 @@ class Dispatcher:
 
     @staticmethod
     def _apply_intent_result(project: Project, item: IntentExecutionResult) -> None:
-        if item.result.retryable:
-            if item.intent.status == IntentStatus.RUNNING:
-                item.intent.release()
+        result = item.result
+        intent = item.intent
+        if result.retryable:
+            if intent.status == IntentStatus.RUNNING:
+                intent.release()
             return
-        fact_text = Dispatcher._worker_result_fact_text(item.result)
+        if result.outcome == "error":
+            if intent.status == IntentStatus.RUNNING:
+                intent.mark_failed(IntentOutcome.ERROR, note=result.detail or "execution failed")
+            return
+        if result.outcome == "refuted":
+            fact_text = Dispatcher._worker_result_fact_text(result)
+            if not fact_text:
+                if intent.status == IntentStatus.RUNNING:
+                    intent.mark_failed(IntentOutcome.EMPTY, note="refuted result missing fact")
+                return
+            fact = project.add_fact(fact_text, kind=FactKind.REFUTED)
+            intent.mark_completed(to_fact_id=fact.id, outcome=IntentOutcome.REFUTED)
+            return
+        fact_text = Dispatcher._worker_result_fact_text(result)
         if fact_text:
-            fact = project.add_fact(fact_text)
-            Dispatcher._complete_intent_with_fact(project, item.intent, fact.id)
-        else:
-            item.intent.mark_completed()
+            fact = project.add_fact(fact_text, kind=FactKind.EVIDENCE)
+            intent.mark_completed(to_fact_id=fact.id, outcome=IntentOutcome.VERIFIED)
+            return
+        if intent.status == IntentStatus.RUNNING:
+            intent.mark_failed(IntentOutcome.EMPTY, note="intent returned no fact or answer")
 
     def _execute_intent(self, project: Project, intent: Intent, mode: DispatchMode) -> WorkerResult:
         with self._state_lock:
@@ -577,10 +647,11 @@ class Dispatcher:
         self._retry_counts.pop(item.intent.id, None)
         detail = item.result.detail or "retry budget exhausted"
         item.result = WorkerResult(
-            fact_description=self._execution_failed_fact(
+            outcome="error",
+            detail=self._execution_failed_fact(
                 f"intent {item.intent.id}",
                 RuntimeError(detail),
-            )
+            ),
         )
 
     def _reason_failure_result(
@@ -612,11 +683,7 @@ class Dispatcher:
         if description == self._fallback_reason_intent_description(project, from_fact_id):
             return self._has_synthetic_fallback(project)
         for intent in project.intents.values():
-            if (
-                intent.description == description
-                and intent.from_fact_id == from_fact_id
-                and intent.status == IntentStatus.ACTIVE
-            ):
+            if intent.description == description and intent.from_fact_id == from_fact_id:
                 return True
         return False
 
@@ -666,7 +733,7 @@ class Dispatcher:
             (
                 fact
                 for fact in sorted(project.facts.values(), key=lambda item: item.id, reverse=True)
-                if fact.id != 1 and answer_text in fact.description
+                if fact.kind == FactKind.EVIDENCE and answer_text in fact.description
             ),
             None,
         )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from echo_agent.models import Intent, Project
+from echo_agent.models import FactKind, Intent, IntentOutcome, Project
 
 
 class PromptBuilder:
@@ -20,8 +20,9 @@ class PromptBuilder:
                 "最终只输出一个 JSON 对象，不要输出 Markdown 或额外解释。",
                 "",
                 "JSON 格式：",
-                '{"answer": "实际获得的完整 flag；不要照抄本句", "fact_description": null}',
-                '{"answer": null, "fact_description": "写入你实际验证得到的具体事实；不要照抄本句"}',
+                '{"answer": "实际获得的完整 flag；不要照抄本句", "fact_description": null, "outcome": "verified"}',
+                '{"answer": null, "fact_description": "写入你实际验证得到的具体事实；不要照抄本句", "outcome": "verified"}',
+                '{"answer": null, "fact_description": "该方向已验证不存在可利用点", "outcome": "refuted"}',
                 "",
                 _format_project_context(project),
                 "",
@@ -43,8 +44,9 @@ class PromptBuilder:
                 "最终只输出一个 JSON 对象，不要输出 Markdown 或额外解释。",
                 "",
                 "JSON 格式：",
-                '{"answer": null, "fact_description": "写入你本次 intent 实际验证得到的具体事实；不要照抄本句"}',
-                '{"answer": "实际获得的完整 flag；不要照抄本句", "fact_description": null}',
+                '{"answer": null, "fact_description": "写入你本次 intent 实际验证得到的具体事实；不要照抄本句", "outcome": "verified"}',
+                '{"answer": null, "fact_description": "该方向已验证不存在可利用点", "outcome": "refuted"}',
+                '{"answer": "实际获得的完整 flag；不要照抄本句", "fact_description": null, "outcome": "verified"}',
                 "",
                 _format_project_context(project),
                 "",
@@ -57,15 +59,17 @@ class PromptBuilder:
         return "\n".join(
             [
                 "你是一个 CTF/渗透测试题目的规划 agent，当前模式是 reason。",
-                "你的任务是根据项目已有 facts 和 intents 判断项目是否已经完成；如果未完成，给出下一批应执行的 intent。",
+                "你的任务是根据 evidence 判断项目是否已经完成；如果未完成，只从 evidence 给出下一批 intent。",
                 "不要执行命令，不要进行扫描或利用，只做推理和规划。",
                 "最终答案的形式不固定，不要假设一定是 flag{...}。你需要根据项目事实图判断是否已经得到题目要求的最终答案。",
-                "只有当 facts 中已经包含可以提交的最终答案时，才返回 completed=true，并将 answer 写为该最终答案。",
+                "只有当 evidence 中已经包含可以提交的最终答案时，才返回 completed=true，并将 answer 写为该最终答案。",
                 "生成的 intent description 必须描述接下来需要探索的方向或验证动作，例如“分析是否存在文件上传漏洞”，不要写成笼统的“继续推进”。",
                 "生成的 intent 应该具体、可执行，并且能由后续 explore 模式在 Kali Docker 容器中完成。",
-                "不是每个 fact 都需要生成 intent；只选择对达成目标有价值、能继续验证或利用的 fact 生成 intent。",
-                "每个新 intent 必须指定它基于哪个 fact 推理而来：from 为已有 fact id；to 可以为 null，系统会先临时连接到目标终点 fact。",
-                "允许同一个 from fact 产生多个 intent，用于表示从同一个事实分叉出多个探索方向。",
+                "不是每条 evidence 都需要生成 intent；只选择对达成目标有价值、能继续验证或利用的 evidence 生成 intent。",
+                "每个新 intent 的 from 必须是 evidence 里的 fact id，不能使用 do_not_repeat 或 goal。",
+                "to 可以为 null，系统会先临时连接到目标终点 fact。",
+                "允许同一个 evidence 产生多个 intent，但不要重复 do_not_repeat 中已有的 description。",
+                "只有 answer 已经出现在某条 evidence 中时，才返回 completed=true。",
                 "如果 completed 为 false，next_intents 至少包含 1 个 intent。",
                 "最终只输出一个 JSON 对象，不要输出 Markdown 或额外解释。",
                 "",
@@ -79,9 +83,38 @@ class PromptBuilder:
 
 
 def _format_project_context(project: Project) -> str:
+    evidence = [
+        {"id": fact.id, "description": fact.description}
+        for fact in sorted(project.facts.values(), key=lambda item: item.id)
+        if fact.kind == FactKind.EVIDENCE
+    ]
+    blocked = [
+        {
+            "id": intent.id,
+            "from": intent.from_fact_id,
+            "description": intent.description,
+            "outcome": intent.outcome.value,
+            "note": intent.note,
+        }
+        for intent in sorted(project.intents.values(), key=lambda item: item.id)
+        if intent.outcome in {IntentOutcome.REFUTED, IntentOutcome.ERROR, IntentOutcome.EMPTY}
+    ]
+    payload = {
+        "id": project.id,
+        "name": project.name,
+        "target_url": project.target_url,
+        "hint": project.hint,
+        "objective": project.objective,
+        "goal": project.facts[1].description if 1 in project.facts else "",
+        "evidence": evidence,
+        "do_not_repeat": blocked,
+    }
     return "\n".join(
         [
-            "项目上下文：",
-            json.dumps(project.to_dict(), ensure_ascii=False, indent=2),
+            "项目上下文分为已知证据、不要重复的路径、终点说明。",
+            "evidence 才是已验证事实。新 intent 的 from 只能取 evidence 的 id。",
+            "do_not_repeat 是已证伪、执行失败或空结果的动作，不要原样重试，也不要把它当成新的探索起点。",
+            "goal 只说明目标，不是证据。",
+            json.dumps(payload, ensure_ascii=False, indent=2),
         ]
     )
