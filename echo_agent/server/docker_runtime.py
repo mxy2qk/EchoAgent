@@ -163,11 +163,21 @@ class DockerProjectRuntime:
             check=False,
         )
         if completed.returncode != 0:
-            stderr = completed.stderr.strip()
-            if "No such object" in stderr or "No such container" in stderr:
+            if self._docker_object_missing(completed.stdout, completed.stderr):
                 return None
-            raise DockerRuntimeError(stderr or f"docker inspect failed for {container}")
+            detail = "\n".join(
+                part.strip() for part in (completed.stderr, completed.stdout) if part and part.strip()
+            )
+            raise DockerRuntimeError(detail or f"docker inspect failed for {container}")
         return completed.stdout.strip()
+
+    @staticmethod
+    def _docker_object_missing(stdout: str, stderr: str) -> bool:
+        text = f"{stdout}\n{stderr}".lower()
+        return any(
+            marker in text
+            for marker in ("no such container", "no such object", "does not exist")
+        )
 
     def _ensure_image(self, log: DockerLogCallback | None = None) -> None:
         self._log(log, "docker image inspect started", image=self.image)

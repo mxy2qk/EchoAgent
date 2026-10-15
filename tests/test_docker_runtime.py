@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 from pathlib import Path
 
 from echo_agent.config import ProjectResource
 from echo_agent.models import Project
-from echo_agent.server.docker_runtime import DockerProjectRuntime
+from echo_agent.server.docker_runtime import DockerProjectRuntime, DockerRuntimeError
 
 
 class RecordingDockerProjectRuntime(DockerProjectRuntime):
@@ -193,6 +195,40 @@ class DockerProjectRuntimeTests(unittest.TestCase):
             tool_path = root / "resources" / "local-bin" / "tool"
             self.assertTrue(tool_path.is_file())
             self.assertTrue(tool_path.stat().st_mode & 0o111)
+
+
+
+    def test_missing_container_message_from_docker29_stdout(self) -> None:
+        runtime = DockerProjectRuntime(
+            image="echo-agent-worker",
+            context=Path("container"),
+            dockerfile=Path("container/Dockerfile"),
+        )
+        missing = subprocess.CompletedProcess(
+            ["docker", "inspect"],
+            1,
+            stdout='Error: container "echo-agent" does not exist\n',
+            stderr="",
+        )
+        lowercase = subprocess.CompletedProcess(
+            ["docker", "inspect"],
+            1,
+            stdout="",
+            stderr="error: no such container: echo-agent\n",
+        )
+        unknown = subprocess.CompletedProcess(
+            ["docker", "inspect"],
+            1,
+            stdout="",
+            stderr="permission denied\n",
+        )
+        with patch("echo_agent.server.docker_runtime.subprocess.run", return_value=missing):
+            self.assertIsNone(runtime._container_state("echo-agent"))
+        with patch("echo_agent.server.docker_runtime.subprocess.run", return_value=lowercase):
+            self.assertIsNone(runtime._container_state("echo-agent"))
+        with patch("echo_agent.server.docker_runtime.subprocess.run", return_value=unknown):
+            with self.assertRaises(DockerRuntimeError):
+                runtime._container_state("echo-agent")
 
 
 if __name__ == "__main__":
