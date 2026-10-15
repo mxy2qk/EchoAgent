@@ -11,7 +11,12 @@ import time
 from collections import deque
 from typing import Mapping, Sequence
 
-from echo_agent.dispatcher.parsing import extract_mode_json_output, parse_reason_result, parse_worker_result
+from echo_agent.dispatcher.parsing import (
+    extract_mode_json_output,
+    extract_mode_json_outputs,
+    parse_reason_result,
+    parse_worker_result,
+)
 from echo_agent.dispatcher.prompts import PromptBuilder
 from echo_agent.dispatcher.types import (
     AgentAdapter,
@@ -382,13 +387,27 @@ class CodexDockerAgent:
                 process.stderr.close()
                 with output_lock:
                     output_count = len(output_lines)
+                    combined = "\n".join(part for part in ("\n".join(output_lines), "\n".join(stderr_lines)) if part).strip()
+                    detail = "\n".join(recent_output).strip()
+                salvaged = self._salvaged_output(combined, mode)
+                if salvaged is not None:
+                    self._log(
+                        log,
+                        f"codex agent timed out in {mode.value} mode, salvaged JSON output",
+                        "warning",
+                        {"timeout_seconds": self.timeout_seconds, "output_lines": output_count},
+                    )
+                    return salvaged
                 self._log(
                     log,
                     f"codex agent timed out in {mode.value} mode",
                     "error",
-                    {"timeout_seconds": self.timeout_seconds, "output_lines": output_count},
+                    {"timeout_seconds": self.timeout_seconds, "output_lines": output_count, "recent_output": detail},
                 )
-                raise RuntimeError(f"codex agent timed out in {mode.value} mode after {self.timeout_seconds}s")
+                raise RuntimeError(self._timeout_message(
+                    f"codex agent timed out in {mode.value} mode after {self.timeout_seconds}s",
+                    detail or combined,
+                ))
             idle_seconds = time.monotonic() - last_activity_at
             if no_output_timeout_seconds > 0 and idle_seconds > no_output_timeout_seconds:
                 self._kill_process(process)
@@ -400,7 +419,22 @@ class CodexDockerAgent:
                 process.stderr.close()
                 with output_lock:
                     output_count = len(output_lines)
+                    combined = "\n".join(part for part in ("\n".join(output_lines), "\n".join(stderr_lines)) if part).strip()
                     detail = "\n".join(recent_output).strip()
+                salvaged = self._salvaged_output(combined, mode)
+                if salvaged is not None:
+                    self._log(
+                        log,
+                        f"codex agent no-output timed out in {mode.value} mode, salvaged JSON output",
+                        "warning",
+                        {
+                            "no_output_timeout_seconds": no_output_timeout_seconds,
+                            "elapsed_seconds": int(elapsed),
+                            "idle_seconds": int(idle_seconds),
+                            "output_lines": output_count,
+                        },
+                    )
+                    return salvaged
                 self._log(
                     log,
                     f"codex agent no-output timed out in {mode.value} mode",
@@ -413,10 +447,11 @@ class CodexDockerAgent:
                         "recent_output": detail,
                     },
                 )
-                raise RuntimeError(
+                raise RuntimeError(self._timeout_message(
                     f"codex agent no-output timed out in {mode.value} mode after "
-                    f"{no_output_timeout_seconds}s without stdout/stderr"
-                )
+                    f"{no_output_timeout_seconds}s without stdout/stderr",
+                    detail or combined,
+                ))
             if time.monotonic() - last_heartbeat_at >= 60:
                 with output_lock:
                     output_count = len(output_lines)
@@ -462,7 +497,7 @@ class CodexDockerAgent:
             stderr_output = "\n".join(stderr_lines).strip()
             detail = "\n".join(recent_output).strip()
         if return_code != 0:
-            salvaged_output = self._extract_mode_json_output(
+            salvaged_output = self._salvaged_output(
                 "\n".join(item for item in [output, stderr_output] if item),
                 mode,
             )
@@ -484,14 +519,28 @@ class CodexDockerAgent:
         return output
 
     @classmethod
-    def _extract_mode_json_output(cls, text: str, mode: DispatchMode) -> str | None:
+    def _salvaged_output(cls, text: str, mode: DispatchMode) -> str | None:
         if mode == DispatchMode.REASON:
-            parsed_mode = "reason"
-        elif mode in {DispatchMode.FIRST_RUN, DispatchMode.EXPLORE}:
-            parsed_mode = "explore"
-        else:
+            return extract_mode_json_output(text, "reason")
+        if mode not in {DispatchMode.FIRST_RUN, DispatchMode.EXPLORE}:
             return None
-        return extract_mode_json_output(text, parsed_mode)
+        found = extract_mode_json_outputs(text, "explore")
+        if not found:
+            return None
+        return "\n".join(found)
+
+    @classmethod
+    def _extract_mode_json_output(cls, text: str, mode: DispatchMode) -> str | None:
+        return cls._salvaged_output(text, mode)
+
+    @staticmethod
+    def _timeout_message(message: str, tail: str) -> str:
+        cleaned = tail.strip()
+        if len(cleaned) > 1500:
+            cleaned = cleaned[-1500:]
+        if not cleaned:
+            return message
+        return f"{message}\noutput_tail:\n{cleaned}"
 
     def _no_output_timeout_for_mode(self, mode: DispatchMode) -> int:
         return self.mode_no_output_timeout_seconds.get(mode.value, self.no_output_timeout_seconds)

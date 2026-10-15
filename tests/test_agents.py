@@ -138,6 +138,47 @@ sys.exit(1)
         self.assertNotIn("turn.completed", output)
         self.assertTrue(any(level == "warning" and "salvaged JSON output" in message for level, message in logs))
 
+
+    def test_hard_timeout_salvages_json_printed_before_hang(self) -> None:
+        script = """
+import json, sys, time
+sys.stdin.read()
+print(json.dumps({"answer": None, "fact_description": "font cache rce", "outcome": "verified"}, ensure_ascii=False), flush=True)
+print(json.dumps({"answer": None, "fact_description": "upload missing", "outcome": "refuted"}, ensure_ascii=False), flush=True)
+time.sleep(5)
+"""
+        agent = CodexDockerAgent(timeout_seconds=1, no_output_timeout_seconds=30)
+        output = agent._run_process(
+            ("python3", "-c", script),
+            prompt="hello",
+            mode=DispatchMode.EXPLORE,
+            env=None,
+            log=None,
+        )
+        self.assertIn("font cache rce", output)
+        self.assertIn("upload missing", output)
+
+    def test_no_output_timeout_keeps_progress_tail_without_promoting_it(self) -> None:
+        script = """
+import sys, time
+sys.stdin.read()
+print("partial rce output before hang", flush=True)
+time.sleep(5)
+"""
+        agent = CodexDockerAgent(timeout_seconds=10, no_output_timeout_seconds=1)
+        with self.assertRaises(RuntimeError) as caught:
+            agent._run_process(
+                ("python3", "-c", script),
+                prompt="hello",
+                mode=DispatchMode.EXPLORE,
+                env=None,
+                log=None,
+            )
+        message = str(caught.exception)
+        self.assertIn("no-output timed out", message)
+        self.assertIn("partial rce output before hang", message)
+        self.assertIn("output_tail", message)
+
     def test_process_is_killed_after_no_output_timeout(self) -> None:
         agent = CodexDockerAgent(timeout_seconds=10, no_output_timeout_seconds=1)
         logs: list[tuple[str, str]] = []

@@ -3,11 +3,36 @@ from __future__ import annotations
 import json
 from typing import Literal
 
-from echo_agent.dispatcher.types import ReasonResult, WorkerResult
+from echo_agent.dispatcher.types import ReasonResult, WorkerObservation, WorkerResult
 
 
 def parse_worker_result(output: str) -> WorkerResult:
-    data = _parse_json_object(output, mode="explore")
+    slices = extract_mode_json_outputs(output, "explore")
+    if not slices:
+        raise ValueError("explore output does not contain a JSON object")
+    parsed = [_worker_result_from_data(json.loads(raw)) for raw in slices]
+    meaningful = [item for item in parsed if item.fact_description or item.answer or item.outcome]
+    if not meaningful:
+        return WorkerResult()
+    last = meaningful[-1]
+    priors = [
+        WorkerObservation(
+            answer=item.answer,
+            fact_description=item.fact_description,
+            outcome=item.outcome,
+        )
+        for item in meaningful[:-1]
+        if item.fact_description or item.answer
+    ]
+    return WorkerResult(
+        answer=last.answer,
+        fact_description=last.fact_description,
+        outcome=last.outcome,
+        prior_results=priors,
+    )
+
+
+def _worker_result_from_data(data: dict[str, object]) -> WorkerResult:
     fact_description = _optional_fact_description(data.get("fact_description"))
     answer = _optional_answer(data.get("answer"))
     if answer is None and fact_description is None and "outcome" not in data:
@@ -109,35 +134,47 @@ def _matches_mode(value: dict[str, object], mode: Literal["explore", "reason"]) 
 
 
 def extract_mode_json_output(output: str, mode: Literal["explore", "reason"]) -> str | None:
-    return _last_mode_json_slice(output, mode, seen=set())
+    found = extract_mode_json_outputs(output, mode)
+    if not found:
+        return None
+    return found[-1]
 
 
-def _last_mode_json_slice(
+def extract_mode_json_outputs(output: str, mode: Literal["explore", "reason"]) -> list[str]:
+    found: list[str] = []
+    _collect_mode_json_slices(output, mode, seen=set(), found=found)
+    return found
+
+
+def _collect_mode_json_slices(
     output: str,
     mode: Literal["explore", "reason"],
     seen: set[str],
-) -> str | None:
+    found: list[str],
+) -> None:
     decoder = json.JSONDecoder()
-    best: str | None = None
-    for index, char in enumerate(output):
-        if char != "{":
-            continue
+    index = 0
+    while index < len(output):
+        brace = output.find("{", index)
+        if brace < 0:
+            return
         try:
-            value, end = decoder.raw_decode(output[index:])
+            value, end = decoder.raw_decode(output[brace:])
         except json.JSONDecodeError:
+            index = brace + 1
             continue
         if not isinstance(value, dict):
+            index = brace + 1
             continue
-        if _matches_mode(value, mode):
-            best = output[index : index + end]
+        before = len(found)
         for nested in _event_texts(value):
             if nested in seen:
                 continue
             seen.add(nested)
-            found = _last_mode_json_slice(nested, mode, seen)
-            if found is not None:
-                best = found
-    return best
+            _collect_mode_json_slices(nested, mode, seen, found)
+        if len(found) == before and _matches_mode(value, mode):
+            found.append(output[brace : brace + end])
+        index = brace + end
 
 
 def _parse_reason_intents(data: dict[str, object]) -> list[dict[str, object]]:

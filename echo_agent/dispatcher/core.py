@@ -17,6 +17,7 @@ from echo_agent.dispatcher.types import (
     ReasonResult,
     Reasoner,
     WorkerAdapter,
+    WorkerObservation,
     WorkerResult,
 )
 from echo_agent.dispatcher.utils import callable_accepts_mode
@@ -567,11 +568,24 @@ class Dispatcher:
     @staticmethod
     def _execution_failed_fact(scope: str, exc: Exception) -> str:
         text = str(exc)
+        tail = ""
+        marker = "\noutput_tail:\n"
+        if marker in text:
+            text, tail = text.split(marker, 1)
+            tail = tail.strip()
+            if len(tail) > 1500:
+                tail = tail[-1500:]
         if "no-output timed out" in text:
-            return f"{scope} 执行超时：Codex 长时间无 stdout/stderr 输出，可能卡在长期运行或无输出命令；需要 reason 重新规划更小的验证步骤"
-        if len(text) > 300:
-            text = f"{text[:297]}..."
-        return f"{scope} execution failed: {type(exc).__name__}: {text}"
+            message = (
+                f"{scope} 执行超时：Codex 长时间无 stdout/stderr 输出，可能卡在长期运行或无输出命令；需要 reason 重新规划更小的验证步骤"
+            )
+        elif len(text) > 300:
+            message = f"{scope} execution failed: {type(exc).__name__}: {text[:297]}..."
+        else:
+            message = f"{scope} execution failed: {type(exc).__name__}: {text}"
+        if tail:
+            return f"{message}{marker}{tail}"
+        return message
 
     @staticmethod
     def _apply_intent_result(project: Project, item: IntentExecutionResult) -> None:
@@ -581,6 +595,8 @@ class Dispatcher:
             if intent.status == IntentStatus.RUNNING:
                 intent.release()
             return
+        for prior in result.prior_results:
+            Dispatcher._add_prior_fact(project, prior)
         if result.outcome == "error":
             if intent.status == IntentStatus.RUNNING:
                 intent.mark_failed(IntentOutcome.ERROR, note=result.detail or "execution failed")
@@ -601,6 +617,21 @@ class Dispatcher:
             return
         if intent.status == IntentStatus.RUNNING:
             intent.mark_failed(IntentOutcome.EMPTY, note="intent returned no fact or answer")
+
+
+    @staticmethod
+    def _add_prior_fact(project: Project, observation: WorkerObservation) -> None:
+        fact_text = observation.fact_description
+        if not fact_text and observation.answer:
+            fact_text = f"agent reported possible final answer: {observation.answer}"
+        if not fact_text:
+            return
+        if observation.outcome == "refuted":
+            project.add_fact(fact_text, kind=FactKind.REFUTED)
+            return
+        if observation.outcome == "error":
+            return
+        project.add_fact(fact_text, kind=FactKind.EVIDENCE)
 
     def _execute_intent(self, project: Project, intent: Intent, mode: DispatchMode) -> WorkerResult:
         with self._state_lock:

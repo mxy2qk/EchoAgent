@@ -7,7 +7,7 @@ import unittest
 from typing import Any
 
 from echo_agent.dispatcher.core import Dispatcher
-from echo_agent.dispatcher.types import DispatchMode, ReasonResult, WorkerResult
+from echo_agent.dispatcher.types import DispatchMode, ReasonResult, WorkerObservation, WorkerResult
 from echo_agent.models import FactKind, IntentOutcome, Project, ProjectStatus
 
 
@@ -769,6 +769,37 @@ class GraphContractTests(unittest.TestCase):
         ]
         self.assertEqual(len(matches), 1)
 
+
+
+
+    def test_prior_facts_are_kept_when_the_last_result_is_refuted(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        intent = project.add_intent("分析上传", from_fact_id=0, to_fact_id=1)
+        intent.mark_running()
+        result = WorkerResult(
+            fact_description="未发现上传点",
+            outcome="refuted",
+            prior_results=[
+                WorkerObservation(fact_description="font cache rce", outcome="verified"),
+            ],
+        )
+        Dispatcher._apply_intent_result(project, type("Item", (), {"intent": intent, "result": result})())
+        self.assertEqual(project.facts[2].description, "font cache rce")
+        self.assertEqual(project.facts[2].kind, FactKind.EVIDENCE)
+        self.assertEqual(project.facts[3].description, "未发现上传点")
+        self.assertEqual(project.facts[3].kind, FactKind.REFUTED)
+        self.assertEqual(intent.outcome, IntentOutcome.REFUTED)
+        self.assertEqual(intent.to_fact_id, 3)
+
+    def test_timeout_tail_is_kept_on_the_failure_note(self) -> None:
+        note = Dispatcher._execution_failed_fact(
+            "intent 3",
+            RuntimeError("codex agent no-output timed out in explore mode after 180s without stdout/stderr\noutput_tail:\npartial rce output before hang"),
+        )
+        self.assertIn("Codex 长时间无 stdout/stderr 输出", note)
+        self.assertIn("partial rce output before hang", note)
 
 
 if __name__ == "__main__":

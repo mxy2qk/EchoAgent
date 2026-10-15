@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Callable, Protocol
 
@@ -16,12 +16,20 @@ class DispatchMode(str, Enum):
 
 
 @dataclass(slots=True)
+class WorkerObservation:
+    answer: str | None = None
+    fact_description: str | None = None
+    outcome: str | None = None
+
+
+@dataclass(slots=True)
 class WorkerResult:
     answer: str | None = None
     fact_description: str | None = None
     retryable: bool = False
     detail: str | None = None
     outcome: str | None = None
+    prior_results: list[WorkerObservation] = field(default_factory=list)
 
     @property
     def has_answer(self) -> bool:

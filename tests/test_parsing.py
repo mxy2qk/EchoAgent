@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from echo_agent.dispatcher.parsing import extract_mode_json_output, parse_reason_result, parse_worker_result
+from echo_agent.dispatcher.parsing import extract_mode_json_output, extract_mode_json_outputs, parse_reason_result, parse_worker_result
 
 
 class DispatcherParsingTests(unittest.TestCase):
@@ -158,6 +158,26 @@ class DispatcherParsingTests(unittest.TestCase):
         extracted = extract_mode_json_output(output, "explore")
         self.assertIn("new", extracted or "")
         self.assertNotIn("old", extracted or "")
+
+
+
+    def test_worker_output_keeps_earlier_facts_before_the_last_result(self) -> None:
+        import json
+
+        first = {"answer": None, "fact_description": "font cache rce", "outcome": "verified"}
+        second = {"answer": None, "fact_description": "upload missing", "outcome": "refuted"}
+        output = "\n".join([
+            json.dumps(first, ensure_ascii=False),
+            json.dumps(second, ensure_ascii=False),
+        ])
+        slices = extract_mode_json_outputs(output, "explore")
+        self.assertEqual(len(slices), 2)
+        result = parse_worker_result(output)
+        self.assertEqual(result.fact_description, "upload missing")
+        self.assertEqual(result.outcome, "refuted")
+        self.assertEqual(len(result.prior_results), 1)
+        self.assertEqual(result.prior_results[0].fact_description, "font cache rce")
+        self.assertEqual(result.prior_results[0].outcome, "verified")
 
 
 if __name__ == "__main__":
