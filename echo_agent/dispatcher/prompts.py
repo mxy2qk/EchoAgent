@@ -66,10 +66,12 @@ class PromptBuilder:
                 "生成的 intent description 必须描述接下来需要探索的方向或验证动作，例如“分析是否存在文件上传漏洞”，不要写成笼统的“继续推进”。",
                 "生成的 intent 应该具体、可执行，并且能由后续 explore 模式在 Kali Docker 容器中完成。",
                 "不是每条 evidence 都需要生成 intent；只选择对达成目标有价值、能继续验证或利用的 evidence 生成 intent。",
-                "每个新 intent 的 from 必须是 evidence 里的 fact id，不能使用 do_not_repeat、already_done 或 goal。",
+                "每个新 intent 的 from 必须是 evidence 里的 fact id，不能使用 findings、do_not_repeat、already_done 或 goal。",
                 "to 可以为 null，系统会先临时连接到目标终点 fact。",
                 "每条 intent 必须带稳定的 action_key，使用小写英文和连字符，例如 check-upload。",
-                "already_done 里已经执行过的 action_key 或描述不能再规划，即使换一种说法也不行。",
+                "already_done 中 outcome 为 refuted 或 verified 的动作不能再规划，即使更换 action_key 或换一种说法也不行。",
+                "outcome 为 error 或 empty 时，不要重复原来的 description；只有描述明显更小的新步骤才可以规划。",
+                "findings 里的证伪正文只用于判断，不能作为 from，也不能换一种说法重做。",
                 "允许同一个 evidence 产生多个 intent，但 action_key 不能重复。",
                 "只有 answer 已经出现在某条 evidence 中时，才返回 completed=true。",
                 "如果没有新的可执行方向，返回 completed=false、next_intents=[]，并用 stop_reason 说明原因。不要为了凑数重复旧动作。",
@@ -96,21 +98,30 @@ def _format_project_context(project: Project) -> str:
         for intent in sorted(project.intents.values(), key=lambda item: item.id)
         if intent.status in {IntentStatus.COMPLETED, IntentStatus.FAILED}
     ]
-    already_done = [
-        {
-            "id": intent.id,
-            "from": intent.from_fact_id,
-            "action_key": intent.action_key,
-            "description": intent.description,
-            "outcome": intent.outcome.value,
-            "note": intent.note,
-        }
-        for intent in executed
-    ]
+    already_done = []
+    for intent in executed:
+        result_text, result_kind = _intent_result(project, intent)
+        already_done.append(
+            {
+                "id": intent.id,
+                "from": intent.from_fact_id,
+                "action_key": intent.action_key,
+                "description": intent.description,
+                "outcome": intent.outcome.value,
+                "note": intent.note,
+                "result": result_text,
+                "result_kind": result_kind,
+            }
+        )
     blocked = [
         item
         for item in already_done
         if item["outcome"] in {IntentOutcome.REFUTED.value, IntentOutcome.ERROR.value, IntentOutcome.EMPTY.value}
+    ]
+    findings = [
+        {"id": fact.id, "kind": fact.kind.value, "description": fact.description}
+        for fact in sorted(project.facts.values(), key=lambda item: item.id)
+        if fact.kind in {FactKind.REFUTED, FactKind.ERROR}
     ]
     payload = {
         "id": project.id,
@@ -120,16 +131,29 @@ def _format_project_context(project: Project) -> str:
         "objective": project.objective,
         "goal": project.facts[1].description if 1 in project.facts else "",
         "evidence": evidence,
+        "findings": findings,
         "already_done": already_done,
         "do_not_repeat": blocked,
     }
     return "\n".join(
         [
-            "项目上下文分为已知证据、已经做过的动作、不要重复的失败路径、终点说明。",
+            "项目上下文分为已知证据、证伪结论、已经做过的动作、不要重复的失败路径、终点说明。",
             "evidence 才是已验证事实。新 intent 的 from 只能取 evidence 的 id。",
-            "already_done 是已经执行过的动作。不要复用其中的 action_key，也不要换句话重复其中的 description。",
-            "do_not_repeat 是已证伪、执行失败或空结果的动作，不要原样重试，也不要把它当成新的探索起点。",
+            "findings 是证伪或错误事实的正文。不能作为 from，也不能换一种说法重做。",
+            "already_done.result 是该动作实际得到的结论。",
+            "refuted 和 verified 不能更换 action_key 或换一种说法再规划。",
+            "error 和 empty 不能原样重复 description；只有更小的新步骤才可以继续。",
+            "do_not_repeat 不能作为新的探索起点。",
             "goal 只说明目标，不是证据。",
             json.dumps(payload, ensure_ascii=False, indent=2),
         ]
     )
+
+
+def _intent_result(project: Project, intent: Intent) -> tuple[str, str]:
+    if intent.to_fact_id is None:
+        return "", ""
+    fact = project.facts.get(intent.to_fact_id)
+    if fact is None:
+        return "", ""
+    return fact.description, fact.kind.value

@@ -9,7 +9,14 @@ from typing import Any
 from echo_agent.dispatcher.core import Dispatcher
 from echo_agent.dispatcher.prompts import PromptBuilder
 from echo_agent.dispatcher.types import DispatchMode, ReasonResult, WorkerObservation, WorkerResult
-from echo_agent.models import FactKind, IntentOutcome, Project, ProjectStatus
+from echo_agent.models import (
+    FactKind,
+    IntentOutcome,
+    Project,
+    ProjectStatus,
+    action_keys_equivalent,
+    descriptions_equivalent,
+)
 
 
 class MemoryProjectClient:
@@ -774,6 +781,51 @@ class StoppingReasoner:
         return ReasonResult(completed=False, next_intents=[], stop_reason="上传和备份面已经验证关闭")
 
 
+class ParaphraseReasoner:
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(
+            completed=False,
+            next_intents=[
+                {
+                    "from": 2,
+                    "to": None,
+                    "action_key": "recheck-upload",
+                    "description": "重新检查上传点",
+                }
+            ],
+        )
+
+
+class SmallerRetryReasoner:
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(
+            completed=False,
+            next_intents=[
+                {
+                    "from": 2,
+                    "to": None,
+                    "action_key": "check-upload",
+                    "description": "只请求 /upload 一次并在十秒内停止",
+                }
+            ],
+        )
+
+
+class SameTextAfterErrorReasoner:
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(
+            completed=False,
+            next_intents=[
+                {
+                    "from": 2,
+                    "to": None,
+                    "action_key": "probe-upload-once",
+                    "description": "分析是否存在文件上传漏洞",
+                }
+            ],
+        )
+
+
 class GraphContractTests(unittest.TestCase):
     def test_refuted_path_does_not_become_next_from(self) -> None:
         project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
@@ -789,16 +841,15 @@ class GraphContractTests(unittest.TestCase):
         )
 
         dispatcher.run_once(project.id, release_project=False)
-        dispatcher.run_once(project.id, release_project=False)
+        result = dispatcher.run_once(project.id, release_project=False)
 
         saved = client.project
         self.assertEqual(saved.facts[3].kind, FactKind.REFUTED)
+        self.assertEqual(saved.facts[3].description, "上传点不存在可利用漏洞")
         self.assertEqual(saved.intents[0].outcome, IntentOutcome.REFUTED)
         self.assertTrue(saved.intents[0].is_completed)
-        planned = saved.active_intents()[0]
-        self.assertEqual(planned.description, "从证伪结果继续枚举")
-        self.assertEqual(planned.from_fact_id, 2)
-        self.assertNotEqual(planned.from_fact_id, 3)
+        self.assertEqual(saved.active_intents(), [])
+        self.assertEqual(result.message, "planned 0 intents")
 
     def test_same_action_key_with_different_description_is_not_planned_again(self) -> None:
         project = DispatcherFactInsertionTests._project_ready_for_reason()
@@ -862,6 +913,97 @@ class GraphContractTests(unittest.TestCase):
         self.assertIn('"already_done"', prompt)
         self.assertEqual(prompt.count("已确认备份目录不存在"), 1)
         self.assertEqual(prompt.count("backup-missing"), 1)
+
+    def test_reason_prompt_includes_refuted_finding(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("发现上传点", fact_id=2)
+        intent = project.add_intent("检查上传点", from_fact_id=2, to_fact_id=1, action_key="check-upload")
+        intent.mark_running()
+        finding = project.add_fact("上传点不存在可利用漏洞", kind=FactKind.REFUTED)
+        intent.mark_completed(to_fact_id=finding.id, outcome=IntentOutcome.REFUTED)
+
+        prompt = PromptBuilder().build_reason_prompt(project)
+
+        self.assertIn('"findings"', prompt)
+        self.assertGreaterEqual(prompt.count("上传点不存在可利用漏洞"), 2)
+        self.assertIn('"result_kind": "refuted"', prompt)
+
+    def test_refuted_paraphrase_does_not_reset_progress(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        done = project.add_intent("检查上传点", from_fact_id=2, to_fact_id=1, action_key="check-upload")
+        done.mark_running()
+        done.mark_completed(outcome=IntentOutcome.REFUTED)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=ParaphraseReasoner(),  # type: ignore[arg-type]
+            max_retryable_attempts=2,
+        )
+
+        results = dispatcher.run_loop(project.id, interval_seconds=0, max_steps=6)
+
+        self.assertEqual(results[-1].mode, DispatchMode.SKIPPED)
+        self.assertEqual(results[-1].message, "reason made no progress")
+        self.assertEqual(len(client.project.intents), 2)
+        self.assertEqual(client.project.active_intents(), [])
+
+    def test_timeout_allows_smaller_retry_with_same_key(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        failed = project.add_intent(
+            "分析是否存在文件上传漏洞",
+            from_fact_id=2,
+            to_fact_id=1,
+            action_key="check-upload",
+        )
+        failed.mark_running()
+        failed.mark_failed(IntentOutcome.ERROR, note="codex agent no-output timed out")
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=SmallerRetryReasoner(),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id)
+
+        active = client.project.active_intents()
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0].action_key, "check-upload")
+        self.assertIn("/upload", active[0].description)
+        self.assertEqual(result.message, "planned 1 intents")
+
+    def test_timeout_does_not_allow_the_same_description(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        failed = project.add_intent(
+            "分析是否存在文件上传漏洞",
+            from_fact_id=2,
+            to_fact_id=1,
+            action_key="check-upload",
+        )
+        failed.mark_running()
+        failed.mark_failed(IntentOutcome.ERROR, note="codex agent no-output timed out")
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=SameTextAfterErrorReasoner(),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id)
+
+        self.assertEqual(client.project.active_intents(), [])
+        self.assertEqual(result.message, "planned 0 intents")
+
+    def test_action_identity_helpers(self) -> None:
+        self.assertTrue(action_keys_equivalent("check-upload", "recheck-upload"))
+        self.assertTrue(action_keys_equivalent("Check Upload", "retry-check-upload"))
+        self.assertFalse(action_keys_equivalent("check-upload", "enum-backup"))
+        self.assertFalse(action_keys_equivalent("", "check-upload"))
+        self.assertTrue(descriptions_equivalent("检查上传点", "重新检查上传点"))
+        self.assertFalse(descriptions_equivalent("检查上传点", "枚举响应头里的内部地址"))
 
     def test_repeated_empty_reason_stops_with_stop_reason(self) -> None:
         project = DispatcherFactInsertionTests._project_ready_for_reason()

@@ -28,8 +28,8 @@ from echo_agent.models import (
     IntentStatus,
     Project,
     ProjectStatus,
-    normalize_action_key,
-    normalize_intent_description,
+    action_keys_equivalent,
+    descriptions_equivalent,
 )
 
 
@@ -307,22 +307,31 @@ class Dispatcher:
 
         planned_intents = self._planned_intents_from_reason_result(project, result)
         planned_count = 0
+        skipped_repeat = 0
+        skipped_from = 0
         for item in planned_intents:
             description = str(item.get("description", "")).strip()
             if not description:
                 continue
-            from_fact_id = self._plannable_fact_id(project, item.get("from"))
-            if from_fact_id is None:
+            raw_from = item.get("from")
+            if raw_from is None:
                 from_fact_id = self._select_reason_fallback_fact_id(project)
+            else:
+                from_fact_id = self._plannable_fact_id(project, raw_from)
+                if from_fact_id is None:
+                    skipped_from += 1
+                    continue
             to_fact_id = self._valid_fact_id(project, item.get("to"))
             if to_fact_id is not None and not self._is_goal_or_evidence(project, to_fact_id):
                 to_fact_id = None
             if to_fact_id is None and 1 in project.facts:
                 to_fact_id = 1
             if from_fact_id is None:
+                skipped_from += 1
                 continue
             action_key = str(item.get("action_key") or "")
             if self._is_duplicate_intent(project, description, from_fact_id, action_key):
+                skipped_repeat += 1
                 continue
             project.add_intent(
                 description=description,
@@ -338,7 +347,12 @@ class Dispatcher:
         if release_project:
             self._release_project(project)
         self.client.save_project(project)
-        self._log(project.id, f"reason planned {planned_count} new intents", "info")
+        self._log(
+            project.id,
+            f"reason planned {planned_count} new intents",
+            "info",
+            {"skipped_repeat": skipped_repeat, "skipped_unplannable_from": skipped_from},
+        )
         if planned_count == 0 and self._no_progress_reasons >= self.max_retryable_attempts:
             message = "reason made no progress"
             stop_reason = str(result.stop_reason or "").strip()
@@ -364,13 +378,12 @@ class Dispatcher:
         project: Project,
         result: ReasonResult,
     ) -> list[dict[str, object]]:
-        fallback_from_fact_id = cls._select_reason_fallback_fact_id(project)
         planned_intents = result.next_intents
         if not planned_intents:
             planned_intents = [
                 {
                     "description": description,
-                    "from": fallback_from_fact_id,
+                    "from": None,
                     "to": None,
                     "action_key": "",
                 }
@@ -383,7 +396,7 @@ class Dispatcher:
             normalized.append(
                 {
                     "description": item.get("description", ""),
-                    "from": item.get("from") if item.get("from") is not None else fallback_from_fact_id,
+                    "from": item.get("from"),
                     "to": item.get("to"),
                     "action_key": str(item.get("action_key") or ""),
                 }
@@ -724,19 +737,19 @@ class Dispatcher:
         from_fact_id: int | None,
         action_key: str = "",
     ) -> bool:
-        normalized_key = normalize_action_key(action_key)
-        normalized_description = normalize_intent_description(description)
         for intent in project.intents.values():
             if intent.from_fact_id != from_fact_id:
                 continue
-            if normalized_key and intent.action_key == normalized_key:
-                return True
-            if (
-                normalized_description
-                and normalize_intent_description(intent.description) == normalized_description
-            ):
+            if self._repeats_intent(intent, description, action_key):
                 return True
         return False
+
+    @staticmethod
+    def _repeats_intent(intent: Intent, description: str, action_key: str) -> bool:
+        same_text = descriptions_equivalent(description, intent.description)
+        if intent.outcome in {IntentOutcome.ERROR, IntentOutcome.EMPTY}:
+            return same_text
+        return same_text or action_keys_equivalent(action_key, intent.action_key)
 
     @staticmethod
     def _create_initial_intent(project: Project) -> Intent:

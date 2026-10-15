@@ -136,6 +136,68 @@ def normalize_intent_description(value: object) -> str:
     return text
 
 
+_ACTION_KEY_DROPPED = {"re", "retry", "again", "repeat", "new", "another", "redo"}
+_ACTION_KEY_REPLACEMENTS = (
+    ("recheck", "check"),
+    ("retest", "test"),
+    ("rescan", "scan"),
+    ("reenum", "enum"),
+)
+
+
+def action_key_cores(value: object) -> frozenset[str]:
+    cores: list[str] = []
+    for token in normalize_action_key(value).split("-"):
+        if not token or token in _ACTION_KEY_DROPPED:
+            continue
+        replacement = token
+        for prefix, core in _ACTION_KEY_REPLACEMENTS:
+            if token == prefix or (token.startswith(prefix) and len(token) - len(prefix) >= 3):
+                replacement = core if token == prefix else token[len(prefix):]
+                break
+        if replacement:
+            cores.append(replacement)
+    return frozenset(cores)
+
+
+def action_keys_equivalent(left: object, right: object) -> bool:
+    left_key = normalize_action_key(left)
+    right_key = normalize_action_key(right)
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    left_cores = action_key_cores(left_key)
+    right_cores = action_key_cores(right_key)
+    return bool(left_cores) and left_cores == right_cores
+
+
+def descriptions_equivalent(left: object, right: object) -> bool:
+    first = normalize_intent_description(left)
+    second = normalize_intent_description(right)
+    if not first or not second:
+        return False
+    if first == second:
+        return True
+    short, long = (first, second) if len(first) <= len(second) else (second, first)
+    if len(short) >= 4 and short in long and len(short) / len(long) >= 0.6:
+        return True
+    return _description_bigram_jaccard(first, second) >= 0.66
+
+
+def _description_bigram_jaccard(first: str, second: str) -> float:
+    first = first.replace(" ", "")
+    second = second.replace(" ", "")
+    if len(first) < 2 or len(second) < 2:
+        return 0.0
+    left = {first[index : index + 2] for index in range(len(first) - 1)}
+    right = {second[index : index + 2] for index in range(len(second) - 1)}
+    union = left | right
+    if not union:
+        return 0.0
+    return len(left & right) / len(union)
+
+
 @dataclass(slots=True)
 class Intent:
     id: int
