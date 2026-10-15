@@ -69,11 +69,26 @@ class DispatcherParsingTests(unittest.TestCase):
         self.assertEqual(
             result.next_intents,
             [
-                {"from": 2, "to": None, "description": "枚举目录"},
-                {"from": 2, "to": 1, "description": "尝试利用上传点"},
+                {"from": 2, "to": None, "description": "枚举目录", "action_key": ""},
+                {"from": 2, "to": 1, "description": "尝试利用上传点", "action_key": ""},
             ],
         )
 
+
+    def test_reason_output_reads_action_key_and_stop_reason(self) -> None:
+        result = parse_reason_result(
+            '{"completed": false, "stop_reason": "没有新方向", "next_intents": ['
+            '{"from": 2, "to": null, "action_key": " Check_Upload ", "description": "枚举"}]}'
+        )
+
+        self.assertEqual(result.stop_reason, "没有新方向")
+        self.assertEqual(result.next_intents[0]["action_key"], "Check_Upload")
+
+    def test_reason_output_rejects_non_string_action_key(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_reason_result(
+                '{"completed": false, "next_intents": [{"description": "枚举", "action_key": 1}]}'
+            )
 
     def test_reason_output_keeps_root_object_when_prefix_contains_nested_intents(self) -> None:
         output = """progress\n{\"completed\": false, \"answer\": null, \"next_intents\": [{\"from\": 2, \"to\": null, \"description\": \"分析上传\"}, {\"from\": 2, \"to\": null, \"description\": \"枚举目录\"}]}\n"""

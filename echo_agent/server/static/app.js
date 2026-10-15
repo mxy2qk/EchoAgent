@@ -808,6 +808,7 @@ function renderIntentDetail(project, intent, detail) {
       <strong>Intent #${escapeHtml(intent.id)}</strong>
       <span class="badge ${escapeHtml(intent.status)}">${escapeHtml(intent.status)}</span>
       <span class="badge ${escapeHtml(intent.outcome || "pending")}">${escapeHtml(intent.outcome || "pending")}</span>
+      ${intent.action_key ? `<span class="badge">${escapeHtml(intent.action_key)}</span>` : ""}
       <button type="button" class="ghost-button" id="clear-graph-selection">关闭</button>
     </div>
     <p>${escapeHtml(intent.description || "无描述")}</p>

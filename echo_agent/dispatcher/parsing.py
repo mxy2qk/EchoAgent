@@ -55,6 +55,7 @@ def parse_reason_result(output: str) -> ReasonResult:
         next_intent_descriptions=[str(item["description"]) for item in intents],
         next_intents=intents,
         answer=_optional_answer(data.get("answer")),
+        stop_reason=_optional_reason_text(data.get("stop_reason"), "stop_reason"),
         raw_output=output,
     )
 
@@ -189,7 +190,7 @@ def _parse_reason_intents(data: dict[str, object]) -> list[dict[str, object]]:
         if isinstance(item, str):
             description = item.strip()
             if description:
-                intents.append({"description": description, "from": None, "to": None})
+                intents.append({"description": description, "from": None, "to": None, "action_key": ""})
             continue
         if not isinstance(item, dict):
             raise ValueError("reason output next_intents items must be strings or objects")
@@ -201,6 +202,7 @@ def _parse_reason_intents(data: dict[str, object]) -> list[dict[str, object]]:
                 "description": description,
                 "from": _optional_int(item.get("from")),
                 "to": _optional_int(item.get("to")),
+                "action_key": _optional_reason_text(item.get("action_key"), "action_key"),
             }
         )
     return intents
@@ -212,6 +214,14 @@ def _optional_int(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError("integer field must be an integer or null")
     return value
+
+
+def _optional_reason_text(value: object, field_name: str) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"reason output {field_name} must be a string or null")
+    return value.strip()
 
 
 def _optional_str(value: object) -> str | None:

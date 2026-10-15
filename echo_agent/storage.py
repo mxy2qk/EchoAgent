@@ -53,6 +53,7 @@ class SQLiteProjectStore:
                     status TEXT NOT NULL,
                     outcome TEXT NOT NULL DEFAULT 'pending',
                     note TEXT NOT NULL DEFAULT '',
+                    action_key TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (project_id, id),
                     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
                     FOREIGN KEY (project_id, from_fact_id) REFERENCES facts(project_id, id),
@@ -98,7 +99,7 @@ class SQLiteProjectStore:
             ).fetchall()
             intent_rows = conn.execute(
                 """
-                SELECT id, from_fact_id, to_fact_id, description, status, outcome, note
+                SELECT id, from_fact_id, to_fact_id, description, status, outcome, note, action_key
                 FROM intents
                 WHERE project_id = ?
                 ORDER BY id
@@ -123,6 +124,7 @@ class SQLiteProjectStore:
                 status=str(row["status"]),
                 outcome=str(row["outcome"]),
                 note=str(row["note"] or ""),
+                action_key=str(row["action_key"] or ""),
             )
             for row in intent_rows
         }
@@ -320,6 +322,8 @@ class SQLiteProjectStore:
             conn.execute("ALTER TABLE intents ADD COLUMN outcome TEXT NOT NULL DEFAULT 'pending'")
         if "note" not in intent_columns:
             conn.execute("ALTER TABLE intents ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+        if "action_key" not in intent_columns:
+            conn.execute("ALTER TABLE intents ADD COLUMN action_key TEXT NOT NULL DEFAULT ''")
 
     @staticmethod
     def _insert_facts(conn: sqlite3.Connection, project_id: int, facts: Iterable[Fact]) -> None:
@@ -361,9 +365,9 @@ class SQLiteProjectStore:
         conn.executemany(
             """
             INSERT INTO intents (
-                project_id, id, from_fact_id, to_fact_id, description, status, outcome, note
+                project_id, id, from_fact_id, to_fact_id, description, status, outcome, note, action_key
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 (
@@ -375,6 +379,7 @@ class SQLiteProjectStore:
                     intent.status.value,
                     intent.outcome.value,
                     intent.note,
+                    intent.action_key,
                 )
                 for intent in intents
             ),

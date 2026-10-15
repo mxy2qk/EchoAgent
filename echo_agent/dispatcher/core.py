@@ -21,7 +21,16 @@ from echo_agent.dispatcher.types import (
     WorkerResult,
 )
 from echo_agent.dispatcher.utils import callable_accepts_mode
-from echo_agent.models import FactKind, Intent, IntentOutcome, IntentStatus, Project, ProjectStatus
+from echo_agent.models import (
+    FactKind,
+    Intent,
+    IntentOutcome,
+    IntentStatus,
+    Project,
+    ProjectStatus,
+    normalize_action_key,
+    normalize_intent_description,
+)
 
 
 class Dispatcher:
@@ -312,12 +321,14 @@ class Dispatcher:
                 to_fact_id = 1
             if from_fact_id is None:
                 continue
-            if self._is_duplicate_intent(project, description, from_fact_id):
+            action_key = str(item.get("action_key") or "")
+            if self._is_duplicate_intent(project, description, from_fact_id, action_key):
                 continue
             project.add_intent(
                 description=description,
                 from_fact_id=from_fact_id,
                 to_fact_id=to_fact_id,
+                action_key=action_key,
             )
             planned_count += 1
         if planned_count == 0:
@@ -329,12 +340,16 @@ class Dispatcher:
         self.client.save_project(project)
         self._log(project.id, f"reason planned {planned_count} new intents", "info")
         if planned_count == 0 and self._no_progress_reasons >= self.max_retryable_attempts:
+            message = "reason made no progress"
+            stop_reason = str(result.stop_reason or "").strip()
+            if stop_reason:
+                message = f"{message}: {stop_reason}"
             self._log(project.id, "reason made no progress; dispatcher will stop", "error")
             return DispatchResult(
                 project.id,
                 DispatchMode.SKIPPED,
                 project.status,
-                "reason made no progress",
+                message,
             )
         return DispatchResult(
             project.id,
@@ -353,27 +368,27 @@ class Dispatcher:
         planned_intents = result.next_intents
         if not planned_intents:
             planned_intents = [
-                {"description": description, "from": fallback_from_fact_id, "to": None}
+                {
+                    "description": description,
+                    "from": fallback_from_fact_id,
+                    "to": None,
+                    "action_key": "",
+                }
                 for description in (result.next_intent_descriptions or [])
             ]
-        if planned_intents:
-            normalized: list[dict[str, object]] = []
-            for item in planned_intents:
-                normalized.append(
-                    {
-                        "description": item.get("description", ""),
-                        "from": item.get("from") if item.get("from") is not None else fallback_from_fact_id,
-                        "to": item.get("to"),
-                    }
-                )
-            return normalized
-        return [
-            {
-                "description": cls._fallback_reason_intent_description(project, fallback_from_fact_id),
-                "from": fallback_from_fact_id,
-                "to": None,
-            }
-        ]
+        if not planned_intents:
+            return []
+        normalized: list[dict[str, object]] = []
+        for item in planned_intents:
+            normalized.append(
+                {
+                    "description": item.get("description", ""),
+                    "from": item.get("from") if item.get("from") is not None else fallback_from_fact_id,
+                    "to": item.get("to"),
+                    "action_key": str(item.get("action_key") or ""),
+                }
+            )
+        return normalized
 
     @staticmethod
     def _select_reason_fallback_fact_id(project: Project) -> int | None:
@@ -428,14 +443,6 @@ class Dispatcher:
             fact.kind == FactKind.EVIDENCE and text in fact.description
             for fact in project.facts.values()
         )
-
-    @staticmethod
-    def _fallback_reason_intent_description(project: Project, from_fact_id: int | None) -> str:
-        if from_fact_id is not None and from_fact_id in project.facts:
-            fact_text = project.facts[from_fact_id].description.strip().splitlines()[0]
-            if fact_text:
-                return f"基于 Fact #{from_fact_id} 分析下一步可验证的漏洞方向"
-        return "分析当前事实图并验证下一步可利用方向"
 
     @staticmethod
     def _valid_fact_id(project: Project, value: object) -> int | None:
@@ -710,18 +717,24 @@ class Dispatcher:
             )
         return DispatchResult(project.id, DispatchMode.REASON, project.status, "reason failed; will retry")
 
-    def _is_duplicate_intent(self, project: Project, description: str, from_fact_id: int | None) -> bool:
-        if description == self._fallback_reason_intent_description(project, from_fact_id):
-            return self._has_synthetic_fallback(project)
+    def _is_duplicate_intent(
+        self,
+        project: Project,
+        description: str,
+        from_fact_id: int | None,
+        action_key: str = "",
+    ) -> bool:
+        normalized_key = normalize_action_key(action_key)
+        normalized_description = normalize_intent_description(description)
         for intent in project.intents.values():
-            if intent.description == description and intent.from_fact_id == from_fact_id:
+            if intent.from_fact_id != from_fact_id:
+                continue
+            if normalized_key and intent.action_key == normalized_key:
                 return True
-        return False
-
-    def _has_synthetic_fallback(self, project: Project) -> bool:
-        for intent in project.intents.values():
-            expected = self._fallback_reason_intent_description(project, intent.from_fact_id)
-            if intent.description == expected:
+            if (
+                normalized_description
+                and normalize_intent_description(intent.description) == normalized_description
+            ):
                 return True
         return False
 

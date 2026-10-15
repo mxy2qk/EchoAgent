@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable
@@ -119,6 +121,21 @@ class Fact:
         )
 
 
+def normalize_action_key(value: object) -> str:
+    text = str(value or "").strip().casefold()
+    text = re.sub(r"[\s_]+", "-", text)
+    text = re.sub(r"[^a-z0-9-]+", "", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+    return text[:64]
+
+
+def normalize_intent_description(value: object) -> str:
+    text = str(value or "").casefold()
+    text = re.sub(r"[^\w\s]+", " ", text, flags=re.UNICODE)
+    text = re.sub(r"[\s_]+", " ", text).strip()
+    return text
+
+
 @dataclass(slots=True)
 class Intent:
     id: int
@@ -128,6 +145,7 @@ class Intent:
     status: IntentStatus = IntentStatus.ACTIVE
     outcome: IntentOutcome = IntentOutcome.PENDING
     note: str = ""
+    action_key: str = ""
 
     def __post_init__(self) -> None:
         if self.id < 0:
@@ -139,6 +157,7 @@ class Intent:
         self.status = IntentStatus.coerce(self.status)
         self.outcome = IntentOutcome.coerce(self.outcome)
         self.note = str(self.note or "")
+        self.action_key = normalize_action_key(self.action_key)
 
     @property
     def is_executable(self) -> bool:
@@ -190,6 +209,7 @@ class Intent:
             "status": self.status.value,
             "outcome": self.outcome.value,
             "note": self.note,
+            "action_key": self.action_key,
         }
 
     @classmethod
@@ -202,6 +222,7 @@ class Intent:
             status=IntentStatus.coerce(data.get("status", IntentStatus.ACTIVE)),
             outcome=IntentOutcome.coerce(data.get("outcome")),
             note=str(data.get("note", "")),
+            action_key=str(data.get("action_key", "")),
         )
 
 
@@ -298,6 +319,7 @@ class Project:
         from_fact_id: int | None = None,
         to_fact_id: int | None = None,
         intent_id: int | None = None,
+        action_key: str = "",
     ) -> Intent:
         next_id = self._next_id(self.intents) if intent_id is None else intent_id
         if next_id in self.intents:
@@ -307,6 +329,7 @@ class Project:
             from_fact_id=from_fact_id,
             to_fact_id=to_fact_id,
             description=description,
+            action_key=action_key,
         )
         self._validate_intent_fact_refs([intent])
         self.intents[intent.id] = intent

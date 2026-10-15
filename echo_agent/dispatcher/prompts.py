@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from echo_agent.models import FactKind, Intent, IntentOutcome, Project
+from echo_agent.models import FactKind, Intent, IntentOutcome, IntentStatus, Project
 
 
 class PromptBuilder:
@@ -66,16 +66,19 @@ class PromptBuilder:
                 "生成的 intent description 必须描述接下来需要探索的方向或验证动作，例如“分析是否存在文件上传漏洞”，不要写成笼统的“继续推进”。",
                 "生成的 intent 应该具体、可执行，并且能由后续 explore 模式在 Kali Docker 容器中完成。",
                 "不是每条 evidence 都需要生成 intent；只选择对达成目标有价值、能继续验证或利用的 evidence 生成 intent。",
-                "每个新 intent 的 from 必须是 evidence 里的 fact id，不能使用 do_not_repeat 或 goal。",
+                "每个新 intent 的 from 必须是 evidence 里的 fact id，不能使用 do_not_repeat、already_done 或 goal。",
                 "to 可以为 null，系统会先临时连接到目标终点 fact。",
-                "允许同一个 evidence 产生多个 intent，但不要重复 do_not_repeat 中已有的 description。",
+                "每条 intent 必须带稳定的 action_key，使用小写英文和连字符，例如 check-upload。",
+                "already_done 里已经执行过的 action_key 或描述不能再规划，即使换一种说法也不行。",
+                "允许同一个 evidence 产生多个 intent，但 action_key 不能重复。",
                 "只有 answer 已经出现在某条 evidence 中时，才返回 completed=true。",
-                "如果 completed 为 false，next_intents 至少包含 1 个 intent。",
+                "如果没有新的可执行方向，返回 completed=false、next_intents=[]，并用 stop_reason 说明原因。不要为了凑数重复旧动作。",
                 "最终只输出一个 JSON 对象，不要输出 Markdown 或额外解释。",
                 "",
                 "JSON 格式：",
-                '{"completed": true, "answer": "实际可提交的最终答案", "next_intents": []}',
-                '{"completed": false, "answer": null, "next_intents": [{"from": 2, "to": null, "description": "分析是否存在文件上传漏洞"}, {"from": 2, "to": null, "description": "枚举 Web 目录和敏感备份文件"}]}',
+                '{"completed": true, "answer": "实际可提交的最终答案", "stop_reason": "", "next_intents": []}',
+                '{"completed": false, "answer": null, "stop_reason": "上传和备份面已经验证关闭", "next_intents": []}',
+                '{"completed": false, "answer": null, "stop_reason": "", "next_intents": [{"from": 2, "to": null, "action_key": "check-upload", "description": "分析是否存在文件上传漏洞"}, {"from": 2, "to": null, "action_key": "enum-backup", "description": "枚举 Web 目录和敏感备份文件"}]}',
                 "",
                 _format_project_context(project),
             ]
@@ -88,16 +91,26 @@ def _format_project_context(project: Project) -> str:
         for fact in sorted(project.facts.values(), key=lambda item: item.id)
         if fact.kind == FactKind.EVIDENCE
     ]
-    blocked = [
+    executed = [
+        intent
+        for intent in sorted(project.intents.values(), key=lambda item: item.id)
+        if intent.status in {IntentStatus.COMPLETED, IntentStatus.FAILED}
+    ]
+    already_done = [
         {
             "id": intent.id,
             "from": intent.from_fact_id,
+            "action_key": intent.action_key,
             "description": intent.description,
             "outcome": intent.outcome.value,
             "note": intent.note,
         }
-        for intent in sorted(project.intents.values(), key=lambda item: item.id)
-        if intent.outcome in {IntentOutcome.REFUTED, IntentOutcome.ERROR, IntentOutcome.EMPTY}
+        for intent in executed
+    ]
+    blocked = [
+        item
+        for item in already_done
+        if item["outcome"] in {IntentOutcome.REFUTED.value, IntentOutcome.ERROR.value, IntentOutcome.EMPTY.value}
     ]
     payload = {
         "id": project.id,
@@ -107,12 +120,14 @@ def _format_project_context(project: Project) -> str:
         "objective": project.objective,
         "goal": project.facts[1].description if 1 in project.facts else "",
         "evidence": evidence,
+        "already_done": already_done,
         "do_not_repeat": blocked,
     }
     return "\n".join(
         [
-            "项目上下文分为已知证据、不要重复的路径、终点说明。",
+            "项目上下文分为已知证据、已经做过的动作、不要重复的失败路径、终点说明。",
             "evidence 才是已验证事实。新 intent 的 from 只能取 evidence 的 id。",
+            "already_done 是已经执行过的动作。不要复用其中的 action_key，也不要换句话重复其中的 description。",
             "do_not_repeat 是已证伪、执行失败或空结果的动作，不要原样重试，也不要把它当成新的探索起点。",
             "goal 只说明目标，不是证据。",
             json.dumps(payload, ensure_ascii=False, indent=2),

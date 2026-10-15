@@ -7,6 +7,7 @@ import unittest
 from typing import Any
 
 from echo_agent.dispatcher.core import Dispatcher
+from echo_agent.dispatcher.prompts import PromptBuilder
 from echo_agent.dispatcher.types import DispatchMode, ReasonResult, WorkerObservation, WorkerResult
 from echo_agent.models import FactKind, IntentOutcome, Project, ProjectStatus
 
@@ -443,7 +444,7 @@ class DispatcherFactInsertionTests(unittest.TestCase):
         self.assertEqual([intent.description for intent in branch_intents], ["枚举目录", "测试上传点"])
         self.assertTrue(all(intent.to_fact_id == 1 for intent in branch_intents))
 
-    def test_reason_empty_plan_creates_fallback_intent(self) -> None:
+    def test_reason_empty_plan_does_not_create_fallback_intent(self) -> None:
         project = self._project_ready_for_reason()
         client = MemoryProjectClient(project)
         dispatcher = Dispatcher(
@@ -452,12 +453,10 @@ class DispatcherFactInsertionTests(unittest.TestCase):
             reasoner=EmptyReasoner(),  # type: ignore[arg-type]
         )
 
-        dispatcher.run_once(project.id)
+        result = dispatcher.run_once(project.id)
 
-        active_intents = client.project.active_intents()
-        self.assertEqual(len(active_intents), 1)
-        self.assertEqual(active_intents[0].from_fact_id, 2)
-        self.assertIn("分析下一步可验证的漏洞方向", active_intents[0].description)
+        self.assertEqual(client.project.active_intents(), [])
+        self.assertEqual(result.message, "planned 0 intents")
 
     def test_reason_completed_without_answer_still_completes_by_codex_judgement(self) -> None:
         project = self._project_ready_for_reason()
@@ -713,14 +712,66 @@ class OuterFailureTests(unittest.TestCase):
             for intent in client.project.intents.values()
             if "分析下一步可验证的漏洞方向" in intent.description
         ]
-        self.assertEqual(len(fallbacks), 1)
+        self.assertEqual(len(fallbacks), 0)
+        self.assertEqual(len(client.project.intents), 1)
         self.assertEqual(results[-1].mode, DispatchMode.SKIPPED)
+        self.assertEqual(results[-1].message, "reason made no progress")
         self.assertNotEqual(client.project.status, ProjectStatus.COMPLETED)
 
 
 class RefutedWorker:
     def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
         return WorkerResult(fact_description="上传点不存在可利用漏洞", outcome="refuted")
+
+
+class RefutedFromReasoner:
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(
+            completed=False,
+            next_intents=[
+                {
+                    "from": 3,
+                    "to": None,
+                    "action_key": "continue-refuted",
+                    "description": "从证伪结果继续枚举",
+                }
+            ],
+        )
+
+
+class RepeatedActionReasoner:
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(
+            completed=False,
+            next_intents=[
+                {
+                    "from": 2,
+                    "to": None,
+                    "action_key": "Check Upload",
+                    "description": "换一种说法检查上传",
+                }
+            ],
+        )
+
+
+class RepeatedDescriptionReasoner:
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(
+            completed=False,
+            next_intents=[
+                {
+                    "from": 2,
+                    "to": None,
+                    "action_key": "other-check",
+                    "description": "检查上传点",
+                }
+            ],
+        )
+
+
+class StoppingReasoner:
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(completed=False, next_intents=[], stop_reason="上传和备份面已经验证关闭")
 
 
 class GraphContractTests(unittest.TestCase):
@@ -734,7 +785,7 @@ class GraphContractTests(unittest.TestCase):
         dispatcher = Dispatcher(
             client=client,  # type: ignore[arg-type]
             worker=RefutedWorker(),  # type: ignore[arg-type]
-            reasoner=EmptyReasoner(),  # type: ignore[arg-type]
+            reasoner=RefutedFromReasoner(),  # type: ignore[arg-type]
         )
 
         dispatcher.run_once(project.id, release_project=False)
@@ -744,9 +795,89 @@ class GraphContractTests(unittest.TestCase):
         self.assertEqual(saved.facts[3].kind, FactKind.REFUTED)
         self.assertEqual(saved.intents[0].outcome, IntentOutcome.REFUTED)
         self.assertTrue(saved.intents[0].is_completed)
-        fallback = saved.active_intents()[0]
-        self.assertEqual(fallback.from_fact_id, 2)
-        self.assertNotEqual(fallback.from_fact_id, 3)
+        planned = saved.active_intents()[0]
+        self.assertEqual(planned.description, "从证伪结果继续枚举")
+        self.assertEqual(planned.from_fact_id, 2)
+        self.assertNotEqual(planned.from_fact_id, 3)
+
+    def test_same_action_key_with_different_description_is_not_planned_again(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        done = project.add_intent(
+            "分析是否存在文件上传漏洞",
+            from_fact_id=2,
+            to_fact_id=1,
+            action_key="check_upload",
+        )
+        done.mark_running()
+        done.mark_completed()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=RepeatedActionReasoner(),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id)
+
+        matches = [intent for intent in client.project.intents.values() if intent.action_key == "check-upload"]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(client.project.active_intents(), [])
+        self.assertEqual(result.message, "planned 0 intents")
+
+    def test_normalized_description_is_not_planned_again(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        done = project.add_intent("检查上传点。", from_fact_id=2, to_fact_id=1, action_key="old-check")
+        done.mark_running()
+        done.mark_completed()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=RepeatedDescriptionReasoner(),  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id)
+
+        matches = [
+            intent
+            for intent in client.project.intents.values()
+            if "上传点" in intent.description
+        ]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(client.project.active_intents(), [])
+
+    def test_reason_prompt_lists_completed_actions_as_already_done(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        done = project.add_intent(
+            "已确认备份目录不存在",
+            from_fact_id=2,
+            to_fact_id=1,
+            action_key="backup-missing",
+        )
+        done.mark_running()
+        done.mark_completed()
+
+        prompt = PromptBuilder().build_reason_prompt(project)
+
+        self.assertIn('"already_done"', prompt)
+        self.assertEqual(prompt.count("已确认备份目录不存在"), 1)
+        self.assertEqual(prompt.count("backup-missing"), 1)
+
+    def test_repeated_empty_reason_stops_with_stop_reason(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=StoppingReasoner(),  # type: ignore[arg-type]
+            max_retryable_attempts=2,
+        )
+
+        results = dispatcher.run_loop(project.id, interval_seconds=0, max_steps=6)
+
+        self.assertEqual(results[-1].mode, DispatchMode.SKIPPED)
+        self.assertEqual(results[-1].message, "reason made no progress: 上传和备份面已经验证关闭")
+        self.assertEqual(client.project.active_intents(), [])
 
     def test_completed_description_is_not_planned_again(self) -> None:
         project = DispatcherFactInsertionTests._project_ready_for_reason()
