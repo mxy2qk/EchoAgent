@@ -62,7 +62,7 @@ class DispatcherRunner:
             thread.start()
             return state
 
-    def stop(self, project_id: int) -> DispatcherRunState:
+    def stop(self, project_id: int, *, join_timeout: float = 5.0) -> DispatcherRunState:
         with self._lock:
             handle = self._runs.get(project_id)
             if handle is None:
@@ -79,13 +79,25 @@ class DispatcherRunner:
         if dispatcher is not None:
             dispatcher.request_stop()
         if thread is not None and thread.is_alive():
-            thread.join(timeout=5)
-        if thread is None or not thread.is_alive():
-            self._release_idle_project(project_id)
-            state.running = False
-        else:
-            state.running = True
+            thread.join(timeout=join_timeout)
+            if thread.is_alive():
+                self._force_stop_container(project_id)
+                thread.join(timeout=join_timeout)
+        self._release_idle_project(project_id)
+        state.running = thread is not None and thread.is_alive()
         return state
+
+    def _force_stop_container(self, project_id: int) -> None:
+        project = self.store.get_project(project_id)
+        self.runtime.force_stop_project_container(
+            project,
+            log=lambda message, level="info", metadata=None: self.store.add_project_log(
+                project.id,
+                message,
+                level=level,
+                metadata=metadata or {},
+            ),
+        )
 
     def _release_idle_project(self, project_id: int) -> None:
         project = self.store.get_project(project_id)

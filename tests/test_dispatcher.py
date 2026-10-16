@@ -848,8 +848,11 @@ class GraphContractTests(unittest.TestCase):
         self.assertEqual(saved.facts[3].description, "上传点不存在可利用漏洞")
         self.assertEqual(saved.intents[0].outcome, IntentOutcome.REFUTED)
         self.assertTrue(saved.intents[0].is_completed)
-        self.assertEqual(saved.active_intents(), [])
-        self.assertEqual(result.message, "planned 0 intents")
+        active = saved.active_intents()
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0].from_fact_id, 2)
+        self.assertNotEqual(active[0].from_fact_id, 3)
+        self.assertEqual(result.message, "planned 1 intents")
 
     def test_same_action_key_with_different_description_is_not_planned_again(self) -> None:
         project = DispatcherFactInsertionTests._project_ready_for_reason()
@@ -1073,6 +1076,148 @@ class GraphContractTests(unittest.TestCase):
         )
         self.assertIn("Codex 长时间无 stdout/stderr 输出", note)
         self.assertIn("partial rce output before hang", note)
+
+    def test_template_worker_does_not_create_refuted_fact(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=TemplateRefutedWorker(),  # type: ignore[arg-type]
+            reasoner=EmptyReasoner(),  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id, release_project=False)
+
+        saved = client.project
+        self.assertFalse(any(fact.kind == FactKind.REFUTED for fact in saved.facts.values()))
+        self.assertFalse(any("该方向已验证不存在可利用点" in fact.description for fact in saved.facts.values()))
+        self.assertEqual(saved.intents[0].outcome, IntentOutcome.EMPTY)
+
+    def test_timeout_tail_becomes_partial_evidence_fact(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=TimeoutTailWorker(),  # type: ignore[arg-type]
+            reasoner=EmptyReasoner(),  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id, release_project=False)
+
+        saved = client.project
+        evidence = [fact for fact in saved.facts.values() if fact.kind == FactKind.EVIDENCE]
+        self.assertEqual(len(evidence), 1)
+        self.assertTrue(evidence[0].description.startswith("未完成执行的输出摘录："))
+        self.assertIn("confirmed hidden SSRF endpoint", evidence[0].description)
+        self.assertNotIn("该方向已验证不存在可利用点", evidence[0].description)
+        self.assertEqual(saved.intents[0].outcome, IntentOutcome.ERROR)
+        self.assertFalse(any(fact.kind == FactKind.REFUTED for fact in saved.facts.values()))
+
+    def test_template_only_timeout_tail_stays_an_error(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=TemplateOnlyTimeoutWorker(),  # type: ignore[arg-type]
+            reasoner=EmptyReasoner(),  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id, release_project=False)
+
+        saved = client.project
+        self.assertFalse(any(fact.kind == FactKind.EVIDENCE for fact in saved.facts.values()))
+        self.assertFalse(any(fact.kind == FactKind.REFUTED for fact in saved.facts.values()))
+        self.assertEqual(saved.intents[0].outcome, IntentOutcome.ERROR)
+        self.assertNotIn("该方向已验证不存在可利用点", saved.intents[0].note)
+
+    def test_short_timeout_tail_does_not_become_evidence(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        intent = project.add_intent("分析上传", from_fact_id=0, to_fact_id=1)
+        intent.mark_running()
+        result = WorkerResult(outcome="error", detail="failed\noutput_tail:\nshort")
+
+        Dispatcher._apply_intent_result(project, type("Item", (), {"intent": intent, "result": result})())
+
+        self.assertFalse(any(fact.kind == FactKind.EVIDENCE for fact in project.facts.values()))
+        self.assertEqual(intent.outcome, IntentOutcome.ERROR)
+
+    def test_closed_from_without_producer_uses_start(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("closed", fact_id=3, kind=FactKind.REFUTED)
+
+        self.assertEqual(Dispatcher._planning_from_fact_id(project, 3), 0)
+        self.assertIsNone(Dispatcher._planning_from_fact_id(project, 99))
+
+    def test_reason_prompt_uses_start_when_only_refuted_facts_exist(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("该方向已验证不存在可利用点", kind=FactKind.REFUTED)
+
+        prompt = PromptBuilder().build_reason_prompt(project)
+
+        self.assertRegex(prompt, r'"allowed_from": \[\s*0\s*\]')
+        self.assertNotRegex(prompt, r'"allowed_from": \[[^\]]*\b2\b')
+        self.assertIn("未完成执行的输出摘录", prompt)
+
+    def test_stop_during_execution_persists_stopped_status(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_intent("分析上传", from_fact_id=0, to_fact_id=1)
+        client = MemoryProjectClient(project)
+        stop_event = threading.Event()
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StopDuringExecutionWorker(stop_event),  # type: ignore[arg-type]
+            stop_event=stop_event,
+        )
+
+        dispatcher.run_once(project.id, release_project=False)
+
+        self.assertEqual(client.project.status, ProjectStatus.STOPED)
+        self.assertEqual(client.project.facts[2].description, "发现隐藏接口 /internal/fetch")
+
+
+class TemplateRefutedWorker:
+    def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+        return WorkerResult(fact_description="该方向已验证不存在可利用点", outcome="refuted")
+
+
+class TimeoutTailWorker:
+    def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+        prose = "confirmed hidden SSRF endpoint at /internal/fetch and MySQL 5.7.29:3306"
+        template = '{"answer": null, "fact_description": "该方向已验证不存在可利用点", "outcome": "refuted"}'
+        raise RuntimeError(
+            "codex agent timed out in first_run mode after 1800s\noutput_tail:\n" + template + "\n" + prose
+        )
+
+
+class TemplateOnlyTimeoutWorker:
+    def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+        raise RuntimeError(
+            'codex agent timed out in first_run mode after 1800s\noutput_tail:\n'
+            '{"answer": null, "fact_description": "该方向已验证不存在可利用点", "outcome": "refuted"}'
+        )
+
+
+class StopDuringExecutionWorker:
+    def __init__(self, stop_event: threading.Event) -> None:
+        self.stop_event = stop_event
+
+    def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+        self.stop_event.set()
+        return WorkerResult(fact_description="发现隐藏接口 /internal/fetch")
 
 
 if __name__ == "__main__":

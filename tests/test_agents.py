@@ -250,6 +250,75 @@ time.sleep(5)
         self.assertIsNotNone(process.returncode)
         self.assertNotEqual(process.returncode, 0)
 
+    def test_nonzero_process_does_not_salvage_prompt_template(self) -> None:
+        import json
+
+        template = json.dumps(
+            {"answer": None, "fact_description": "该方向已验证不存在可利用点", "outcome": "refuted"},
+            ensure_ascii=False,
+        )
+        script = (
+            "import sys\n"
+            "sys.stdin.read()\n"
+            f"print({template!r})\n"
+            "raise SystemExit(1)\n"
+        )
+        agent = CodexDockerAgent(timeout_seconds=5)
+
+        with self.assertRaises(RuntimeError) as caught:
+            agent._run_process(
+                ("python3", "-c", script),
+                prompt="hello",
+                mode=DispatchMode.EXPLORE,
+                env=None,
+                log=None,
+            )
+
+        self.assertIn("exit code", str(caught.exception))
+
+    def test_hard_timeout_keeps_real_fact_and_drops_prompt_template(self) -> None:
+        script = """
+import json, sys, time
+sys.stdin.read()
+print(json.dumps({"answer": None, "fact_description": "hidden ssrf endpoint", "outcome": "verified"}, ensure_ascii=False), flush=True)
+print(json.dumps({"answer": None, "fact_description": "该方向已验证不存在可利用点", "outcome": "refuted"}, ensure_ascii=False), flush=True)
+time.sleep(5)
+"""
+        agent = CodexDockerAgent(timeout_seconds=1, no_output_timeout_seconds=30)
+
+        output = agent._run_process(
+            ("python3", "-c", script),
+            prompt="hello",
+            mode=DispatchMode.EXPLORE,
+            env=None,
+            log=None,
+        )
+
+        self.assertIn("hidden ssrf endpoint", output)
+        self.assertNotIn("该方向已验证不存在可利用点", output)
+
+    def test_process_stdin_uses_utf8_encoding(self) -> None:
+        agent = CodexDockerAgent(timeout_seconds=5)
+        recorded: dict[str, object] = {}
+
+        def fake_popen(command, **kwargs):
+            recorded.update(kwargs)
+            raise RuntimeError("stop before consume")
+
+        with patch("echo_agent.dispatcher.agents.subprocess.Popen", fake_popen):
+            with self.assertRaisesRegex(RuntimeError, "stop before consume"):
+                agent._run_process(
+                    ("true",),
+                    prompt="侦察目标",
+                    mode=DispatchMode.EXPLORE,
+                    env=None,
+                    log=None,
+                )
+
+        self.assertEqual(recorded["encoding"], "utf-8")
+        self.assertEqual(recorded["errors"], "replace")
+        self.assertIs(recorded["text"], True)
+
 
 if __name__ == "__main__":
     unittest.main()

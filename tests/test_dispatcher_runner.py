@@ -92,6 +92,40 @@ class DispatcherRunnerStopTests(unittest.TestCase):
             self.assertEqual(saved.status, ProjectStatus.STOPED)
             self.assertEqual(runtime.commands, [["docker", "stop", "echo-agent-task-7"]])
 
+    def test_stop_force_stops_container_when_thread_ignores_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteProjectStore(Path(directory) / "state.db")
+            project = store.create_project(project_id=7, target_url="http://target", objective="get flag")
+            project.activate()
+            project.start()
+            store.save_project(project)
+            runtime = ForceStopRuntime()
+            runner = DispatcherRunner(store, runtime=runtime)
+            started = threading.Event()
+            release = threading.Event()
+
+            def ignore_stop() -> None:
+                started.set()
+                release.wait(5)
+
+            thread = threading.Thread(target=ignore_stop, daemon=True)
+            thread.start()
+            started.wait(1)
+            runner._runs[project.id] = _RunHandle(
+                thread=thread,
+                stop_event=threading.Event(),
+                state=DispatcherRunState(project_id=project.id, running=True),
+            )
+            try:
+                state = runner.stop(project.id, join_timeout=0.05)
+                saved = store.get_project(project.id)
+                self.assertEqual(saved.status, ProjectStatus.STOPED)
+                self.assertIn(["docker", "stop", "-t", "0", "echo-agent-task-7"], runtime.commands)
+                self.assertTrue(state.running)
+            finally:
+                release.set()
+                thread.join(timeout=1)
+
 
 if __name__ == "__main__":
     unittest.main()

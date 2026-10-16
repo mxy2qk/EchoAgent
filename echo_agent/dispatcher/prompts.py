@@ -59,18 +59,20 @@ class PromptBuilder:
         return "\n".join(
             [
                 "你是一个 CTF/渗透测试题目的规划 agent，当前模式是 reason。",
-                "你的任务是根据 evidence 判断项目是否已经完成；如果未完成，只从 evidence 给出下一批 intent。",
+                "你的任务是根据 evidence 判断项目是否已经完成；如果未完成，只从 allowed_from 给出下一批 intent。",
                 "不要执行命令，不要进行扫描或利用，只做推理和规划。",
                 "最终答案的形式不固定，不要假设一定是 flag{...}。你需要根据项目事实图判断是否已经得到题目要求的最终答案。",
                 "只有当 evidence 中已经包含可以提交的最终答案时，才返回 completed=true，并将 answer 写为该最终答案。",
                 "生成的 intent description 必须描述接下来需要探索的方向或验证动作，例如“分析是否存在文件上传漏洞”，不要写成笼统的“继续推进”。",
                 "生成的 intent 应该具体、可执行，并且能由后续 explore 模式在 Kali Docker 容器中完成。",
                 "不是每条 evidence 都需要生成 intent；只选择对达成目标有价值、能继续验证或利用的 evidence 生成 intent。",
-                "每个新 intent 的 from 必须是 evidence 里的 fact id，不能使用 findings、do_not_repeat、already_done 或 goal。",
+                "每个新 intent 的 from 必须取 allowed_from 里的 fact id。evidence 为空时 allowed_from 只有起点，通常是 0。",
+                "不能使用 findings、do_not_repeat、already_done、证伪事实、错误事实或 goal 作为 from。",
                 "to 可以为 null，系统会先临时连接到目标终点 fact。",
                 "每条 intent 必须带稳定的 action_key，使用小写英文和连字符，例如 check-upload。",
                 "already_done 中 outcome 为 refuted 或 verified 的动作不能再规划，即使更换 action_key 或换一种说法也不行。",
                 "outcome 为 error 或 empty 时，不要重复原来的 description；只有描述明显更小的新步骤才可以规划。",
+                "error、empty 的 note，以及“未完成执行的输出摘录”，都不是证伪结论，只能改写成更小的新步骤。",
                 "findings 里的证伪正文只用于判断，不能作为 from，也不能换一种说法重做。",
                 "允许同一个 evidence 产生多个 intent，但 action_key 不能重复。",
                 "只有 answer 已经出现在某条 evidence 中时，才返回 completed=true。",
@@ -123,6 +125,13 @@ def _format_project_context(project: Project) -> str:
         for fact in sorted(project.facts.values(), key=lambda item: item.id)
         if fact.kind in {FactKind.REFUTED, FactKind.ERROR}
     ]
+    evidence_ids = [item["id"] for item in evidence]
+    if evidence_ids:
+        allowed_from = evidence_ids
+    elif 0 in project.facts:
+        allowed_from = [0]
+    else:
+        allowed_from = []
     payload = {
         "id": project.id,
         "name": project.name,
@@ -131,6 +140,7 @@ def _format_project_context(project: Project) -> str:
         "objective": project.objective,
         "goal": project.facts[1].description if 1 in project.facts else "",
         "evidence": evidence,
+        "allowed_from": allowed_from,
         "findings": findings,
         "already_done": already_done,
         "do_not_repeat": blocked,
@@ -138,11 +148,13 @@ def _format_project_context(project: Project) -> str:
     return "\n".join(
         [
             "项目上下文分为已知证据、证伪结论、已经做过的动作、不要重复的失败路径、终点说明。",
-            "evidence 才是已验证事实。新 intent 的 from 只能取 evidence 的 id。",
+            "evidence 才是已验证事实。新 intent 的 from 只能取 allowed_from。",
+            "evidence 为空时，allowed_from 只包含起点，避免没有证据时无法继续规划。",
             "findings 是证伪或错误事实的正文。不能作为 from，也不能换一种说法重做。",
             "already_done.result 是该动作实际得到的结论。",
             "refuted 和 verified 不能更换 action_key 或换一种说法再规划。",
             "error 和 empty 不能原样重复 description；只有更小的新步骤才可以继续。",
+            "未完成执行的输出摘录只是超时前的片段，必须改成更小的步骤，不能当成证伪。",
             "do_not_repeat 不能作为新的探索起点。",
             "goal 只说明目标，不是证据。",
             json.dumps(payload, ensure_ascii=False, indent=2),

@@ -10,7 +10,12 @@ def parse_worker_result(output: str) -> WorkerResult:
     slices = extract_mode_json_outputs(output, "explore")
     if not slices:
         raise ValueError("explore output does not contain a JSON object")
-    parsed = [_worker_result_from_data(json.loads(raw)) for raw in slices]
+    parsed = []
+    for raw in slices:
+        data = json.loads(raw)
+        if is_template_worker_payload(data):
+            continue
+        parsed.append(_worker_result_from_data(data))
     meaningful = [item for item in parsed if item.fact_description or item.answer or item.outcome]
     if not meaningful:
         return WorkerResult()
@@ -262,7 +267,61 @@ def _optional_fact_description(value: object) -> str | None:
         "new fact description",
         "写入你实际验证得到的具体事实；不要照抄本句",
         "写入你本次 intent 实际验证得到的具体事实；不要照抄本句",
+        "该方向已验证不存在可利用点",
     }
     if normalized in placeholder_facts:
         return None
     return text
+
+
+def is_template_worker_payload(data: dict[str, object]) -> bool:
+    if _optional_fact_description(data.get("fact_description")) is not None:
+        return False
+    if _optional_answer(data.get("answer")) is not None:
+        return False
+    return "answer" in data or "fact_description" in data or "outcome" in data
+
+
+def substantive_worker_output(output: str) -> str | None:
+    kept: list[str] = []
+    for raw in extract_mode_json_outputs(output, "explore"):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict) or is_template_worker_payload(data):
+            continue
+        result = _worker_result_from_data(data)
+        if result.fact_description or result.answer:
+            kept.append(raw)
+    if not kept:
+        return None
+    return "\n".join(kept)
+
+
+def strip_prompt_template_text(text: str) -> str:
+    cleaned = text
+    decoder = json.JSONDecoder()
+    index = 0
+    while index < len(cleaned):
+        brace = cleaned.find("{", index)
+        if brace < 0:
+            break
+        try:
+            value, end = decoder.raw_decode(cleaned[brace:])
+        except json.JSONDecodeError:
+            index = brace + 1
+            continue
+        if isinstance(value, dict) and is_template_worker_payload(value):
+            cleaned = f"{cleaned[:brace]} {cleaned[brace + end:]}"
+            index = brace
+            continue
+        index = brace + end
+    for phrase in (
+        "该方向已验证不存在可利用点",
+        "写入你实际验证得到的具体事实；不要照抄本句",
+        "写入你本次 intent 实际验证得到的具体事实；不要照抄本句",
+        "初始执行得到的新事实",
+    ):
+        cleaned = cleaned.replace(phrase, " ")
+    return " ".join(cleaned.split())

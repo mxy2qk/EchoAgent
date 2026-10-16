@@ -13,9 +13,9 @@ from typing import Mapping, Sequence
 
 from echo_agent.dispatcher.parsing import (
     extract_mode_json_output,
-    extract_mode_json_outputs,
     parse_reason_result,
     parse_worker_result,
+    substantive_worker_output,
 )
 from echo_agent.dispatcher.prompts import PromptBuilder
 from echo_agent.dispatcher.types import (
@@ -276,6 +276,8 @@ class CodexDockerAgent:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             env=env,
             start_new_session=True,
@@ -524,10 +526,7 @@ class CodexDockerAgent:
             return extract_mode_json_output(text, "reason")
         if mode not in {DispatchMode.FIRST_RUN, DispatchMode.EXPLORE}:
             return None
-        found = extract_mode_json_outputs(text, "explore")
-        if not found:
-            return None
-        return "\n".join(found)
+        return substantive_worker_output(text)
 
     @classmethod
     def _extract_mode_json_output(cls, text: str, mode: DispatchMode) -> str | None:
@@ -536,8 +535,8 @@ class CodexDockerAgent:
     @staticmethod
     def _timeout_message(message: str, tail: str) -> str:
         cleaned = tail.strip()
-        if len(cleaned) > 1500:
-            cleaned = cleaned[-1500:]
+        if len(cleaned) > 4000:
+            cleaned = cleaned[-4000:]
         if not cleaned:
             return message
         return f"{message}\noutput_tail:\n{cleaned}"

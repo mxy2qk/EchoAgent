@@ -8,6 +8,7 @@ from typing import Iterable, Mapping
 
 from echo_agent.dispatcher.agents import CodexDockerAgent, CodexReasoner, CodexWorker
 from echo_agent.dispatcher.client import ProjectClient
+from echo_agent.dispatcher.parsing import _optional_fact_description, strip_prompt_template_text
 from echo_agent.dispatcher.prompts import PromptBuilder
 from echo_agent.dispatcher.types import (
     AgentAdapter,
@@ -34,6 +35,11 @@ from echo_agent.models import (
 
 
 class Dispatcher:
+    _OUTPUT_TAIL_MARKER = "\noutput_tail:\n"
+    _PARTIAL_OUTPUT_PREFIX = "未完成执行的输出摘录："
+    _PARTIAL_OUTPUT_MIN_CHARS = 40
+    _PARTIAL_OUTPUT_LIMIT = 4000
+
     def __init__(
         self,
         client: ProjectClient,
@@ -240,12 +246,8 @@ class Dispatcher:
                 },
             )
 
-        if release_project:
-            with self._state_lock:
-                self._release_project(project)
-                self.client.save_project(project)
-        else:
-            self.client.save_project(project)
+        with self._state_lock:
+            self._persist_step(project, release_project=release_project)
         self._log(
             project.id,
             f"explore finished {finished_count} intents, released {released_count}",
@@ -262,6 +264,7 @@ class Dispatcher:
         self._log(project.id, "reason started", "info")
         if not self._acquire_model_slot():
             self._log(project.id, "reason skipped because stop was requested", "warning")
+            self._persist_step(project, release_project=release_project)
             return DispatchResult(project.id, DispatchMode.REASON, project.status, "reason skipped")
         try:
             try:
@@ -277,7 +280,7 @@ class Dispatcher:
         if result.completed:
             if any(intent.status == IntentStatus.RUNNING for intent in project.intents.values()):
                 recovered = self._recover_stranded_intents(project)
-                self.client.save_project(project)
+                self._persist_step(project, release_project=release_project)
                 self._log(
                     project.id,
                     "reason completion deferred because intents were still running",
@@ -295,7 +298,7 @@ class Dispatcher:
                 self._connect_answer_fact_to_goal(project, result.answer)
                 self._complete_project(project)
                 self._no_progress_reasons = 0
-                self.client.save_project(project)
+                self._persist_step(project, release_project=release_project)
                 self._log(project.id, "reason marked project completed", "success", {"has_answer": True})
                 return DispatchResult(project.id, DispatchMode.COMPLETED, project.status, "reason marked project completed")
             self._log(
@@ -317,7 +320,7 @@ class Dispatcher:
             if raw_from is None:
                 from_fact_id = self._select_reason_fallback_fact_id(project)
             else:
-                from_fact_id = self._plannable_fact_id(project, raw_from)
+                from_fact_id = self._planning_from_fact_id(project, raw_from)
                 if from_fact_id is None:
                     skipped_from += 1
                     continue
@@ -344,9 +347,7 @@ class Dispatcher:
             self._no_progress_reasons += 1
         else:
             self._no_progress_reasons = 0
-        if release_project:
-            self._release_project(project)
-        self.client.save_project(project)
+        self._persist_step(project, release_project=release_project)
         self._log(
             project.id,
             f"reason planned {planned_count} new intents",
@@ -439,6 +440,47 @@ class Dispatcher:
         if fact is None or not fact.is_plannable:
             return None
         return fact_id
+
+    @staticmethod
+    def _planning_from_fact_id(project: Project, value: object) -> int | None:
+        fact_id = Dispatcher._plannable_fact_id(project, value)
+        if fact_id is not None:
+            return fact_id
+        return Dispatcher._redirect_closed_from_fact_id(project, value)
+
+    @staticmethod
+    def _redirect_closed_from_fact_id(project: Project, value: object) -> int | None:
+        fact_id = Dispatcher._valid_fact_id(project, value)
+        if fact_id is None:
+            return None
+        fact = project.facts.get(fact_id)
+        if fact is None or fact.kind not in {FactKind.REFUTED, FactKind.ERROR}:
+            return None
+        producers = [
+            intent
+            for intent in project.intents.values()
+            if intent.to_fact_id == fact_id and intent.from_fact_id is not None
+        ]
+        if producers:
+            latest = max(producers, key=lambda item: item.id)
+            source = project.facts.get(latest.from_fact_id)
+            if source is not None and source.is_plannable:
+                return source.id
+        start = project.facts.get(0)
+        if start is not None and start.is_plannable:
+            return start.id
+        return None
+
+    @classmethod
+    def _record_partial_output(cls, project: Project, detail: str | None) -> None:
+        if not detail or cls._OUTPUT_TAIL_MARKER not in detail:
+            return
+        tail = strip_prompt_template_text(detail.split(cls._OUTPUT_TAIL_MARKER, 1)[1]).strip()
+        if len(tail) < cls._PARTIAL_OUTPUT_MIN_CHARS:
+            return
+        if len(tail) > cls._PARTIAL_OUTPUT_LIMIT:
+            tail = tail[-cls._PARTIAL_OUTPUT_LIMIT:]
+        project.add_fact(f"{cls._PARTIAL_OUTPUT_PREFIX}\n{tail}", kind=FactKind.EVIDENCE)
 
     @staticmethod
     def _is_goal_or_evidence(project: Project, fact_id: int) -> bool:
@@ -592,9 +634,9 @@ class Dispatcher:
         marker = "\noutput_tail:\n"
         if marker in text:
             text, tail = text.split(marker, 1)
-            tail = tail.strip()
-            if len(tail) > 1500:
-                tail = tail[-1500:]
+            tail = strip_prompt_template_text(tail).strip()
+            if len(tail) > Dispatcher._PARTIAL_OUTPUT_LIMIT:
+                tail = tail[-Dispatcher._PARTIAL_OUTPUT_LIMIT:]
         if "no-output timed out" in text:
             message = (
                 f"{scope} 执行超时：Codex 长时间无 stdout/stderr 输出，可能卡在长期运行或无输出命令；需要 reason 重新规划更小的验证步骤"
@@ -618,6 +660,7 @@ class Dispatcher:
         for prior in result.prior_results:
             Dispatcher._add_prior_fact(project, prior)
         if result.outcome == "error":
+            Dispatcher._record_partial_output(project, result.detail)
             if intent.status == IntentStatus.RUNNING:
                 intent.mark_failed(IntentOutcome.ERROR, note=result.detail or "execution failed")
             return
@@ -641,7 +684,7 @@ class Dispatcher:
 
     @staticmethod
     def _add_prior_fact(project: Project, observation: WorkerObservation) -> None:
-        fact_text = observation.fact_description
+        fact_text = _optional_fact_description(observation.fact_description)
         if not fact_text and observation.answer:
             fact_text = f"agent reported possible final answer: {observation.answer}"
         if not fact_text:
@@ -682,9 +725,7 @@ class Dispatcher:
         self._consume_retry_budget(item)
         with self._state_lock:
             self._apply_intent_result(project, item)
-            if release_project:
-                self._release_project(project)
-            self.client.save_project(project)
+            self._persist_step(project, release_project=release_project)
 
     def _consume_retry_budget(self, item: IntentExecutionResult) -> None:
         if not item.result.retryable or self._stop_event.is_set():
@@ -718,9 +759,7 @@ class Dispatcher:
             "error" if self._reason_failures >= self.max_retryable_attempts else "warning",
             {"attempt": self._reason_failures, "error": str(exc)},
         )
-        if release_project:
-            self._release_project(project)
-        self.client.save_project(project)
+        self._persist_step(project, release_project=release_project)
         if self._reason_failures >= self.max_retryable_attempts and not self._stop_event.is_set():
             return DispatchResult(
                 project.id,
@@ -767,8 +806,9 @@ class Dispatcher:
 
     @staticmethod
     def _worker_result_fact_text(result: WorkerResult) -> str | None:
-        if result.fact_description:
-            return result.fact_description
+        fact_description = _optional_fact_description(result.fact_description)
+        if fact_description:
+            return fact_description
         if result.answer:
             return f"agent reported possible final answer: {result.answer}"
         return None
@@ -830,6 +870,11 @@ class Dispatcher:
             project.start()
         if project.status == ProjectStatus.RUNNING:
             project.complete()
+
+    def _persist_step(self, project: Project, release_project: bool = False) -> None:
+        if release_project or self._stop_event.is_set():
+            self._release_project(project)
+        self.client.save_project(project)
 
     @staticmethod
     def _release_project(project: Project) -> None:

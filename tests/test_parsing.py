@@ -194,6 +194,39 @@ class DispatcherParsingTests(unittest.TestCase):
         self.assertEqual(result.prior_results[0].fact_description, "font cache rce")
         self.assertEqual(result.prior_results[0].outcome, "verified")
 
+    def test_worker_output_ignores_refuted_prompt_template(self) -> None:
+        result = parse_worker_result(
+            '{"answer": null, "fact_description": "该方向已验证不存在可利用点", "outcome": "refuted"}'
+        )
+
+        self.assertIsNone(result.fact_description)
+        self.assertIsNone(result.answer)
+        self.assertIsNone(result.outcome)
+        self.assertEqual(result.prior_results, [])
+
+    def test_worker_output_keeps_real_json_beside_prompt_template(self) -> None:
+        import json
+
+        template = {
+            "answer": None,
+            "fact_description": "该方向已验证不存在可利用点",
+            "outcome": "refuted",
+        }
+        real = {"answer": None, "fact_description": "内网 MySQL 5.7.29:3306", "outcome": "verified"}
+        output = "\n".join(
+            [
+                json.dumps(template, ensure_ascii=False),
+                json.dumps(real, ensure_ascii=False),
+                json.dumps(template, ensure_ascii=False),
+            ]
+        )
+
+        result = parse_worker_result(output)
+
+        self.assertEqual(result.fact_description, "内网 MySQL 5.7.29:3306")
+        self.assertEqual(result.outcome, "verified")
+        self.assertEqual(result.prior_results, [])
+
 
 if __name__ == "__main__":
     unittest.main()
