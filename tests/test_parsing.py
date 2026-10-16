@@ -228,5 +228,58 @@ class DispatcherParsingTests(unittest.TestCase):
         self.assertEqual(result.prior_results, [])
 
 
+    def test_reason_output_drops_exact_prompt_template_intents(self) -> None:
+        import json
+
+        template = {
+            "completed": False,
+            "next_intents": [
+                {
+                    "from": 2,
+                    "to": None,
+                    "action_key": "check-upload",
+                    "description": "分析是否存在文件上传漏洞",
+                },
+                {
+                    "from": 2,
+                    "to": None,
+                    "action_key": "enum-backup",
+                    "description": "枚举 Web 目录和敏感备份文件",
+                },
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "prompt template intents"):
+            parse_reason_result(json.dumps(template, ensure_ascii=False))
+
+        mixed = {
+            "completed": False,
+            "next_intents": template["next_intents"]
+            + [
+                {
+                    "from": 2,
+                    "to": None,
+                    "action_key": "check-upload",
+                    "description": "只请求 /upload 一次并在十秒内停止",
+                }
+            ],
+        }
+        result = parse_reason_result(json.dumps(mixed, ensure_ascii=False))
+        self.assertEqual(len(result.next_intents or []), 1)
+        self.assertEqual(result.next_intents[0]["description"], "只请求 /upload 一次并在十秒内停止")
+        self.assertEqual(result.next_intents[0]["action_key"], "check-upload")
+
+        completed = dict(template)
+        completed["completed"] = True
+        completed["answer"] = "flag{ok}"
+        result = parse_reason_result(json.dumps(completed, ensure_ascii=False))
+        self.assertTrue(result.completed)
+        self.assertEqual(result.next_intents, [])
+
+        empty = {"completed": False, "next_intents": []}
+        result = parse_reason_result(json.dumps(empty, ensure_ascii=False))
+        self.assertEqual(result.next_intents, [])
+
+
+
 if __name__ == "__main__":
     unittest.main()

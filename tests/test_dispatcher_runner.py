@@ -5,6 +5,9 @@ import threading
 import unittest
 from pathlib import Path
 
+from unittest.mock import patch
+
+from echo_agent.dispatcher.types import DispatchMode, DispatchResult
 from echo_agent.models import ProjectStatus
 from echo_agent.server.dispatcher_runner import DispatcherRunner, DispatcherRunState, _RunHandle
 from echo_agent.server.docker_runtime import DockerProjectRuntime
@@ -125,6 +128,68 @@ class DispatcherRunnerStopTests(unittest.TestCase):
             finally:
                 release.set()
                 thread.join(timeout=1)
+
+
+class _ScriptedDispatcher:
+    script: list[DispatchResult] = []
+    calls = 0
+
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def run_once(self, project_id: int, release_project: bool = False) -> DispatchResult:
+        type(self).calls += 1
+        if type(self).script:
+            return type(self).script.pop(0)
+        return DispatchResult(project_id, DispatchMode.SKIPPED, ProjectStatus.RUNNING, "reason made no progress")
+
+    def request_stop(self) -> None:
+        return None
+
+    def _release_project_if_running(self, project_id: int) -> None:
+        return None
+
+
+class DispatcherRunnerBudgetTests(unittest.TestCase):
+    def _start(self, script: list[DispatchResult], max_steps: int) -> DispatcherRunState:
+        _ScriptedDispatcher.script = list(script)
+        _ScriptedDispatcher.calls = 0
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteProjectStore(Path(directory) / "state.db")
+            project = store.create_project(project_id=9, target_url="http://target", objective="get flag")
+            project.activate()
+            store.save_project(project)
+            runner = DispatcherRunner(store, runtime=ForceStopRuntime())
+            with patch("echo_agent.server.dispatcher_runner.Dispatcher", _ScriptedDispatcher):
+                state = runner.start(project.id, interval_seconds=0, max_steps=max_steps)
+                thread = runner._runs[project.id].thread
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive())
+                return state
+
+    def test_empty_reason_does_not_consume_runner_budget(self) -> None:
+        state = self._start(
+            [
+                DispatchResult(9, DispatchMode.REASON, ProjectStatus.RUNNING, "planned 0 intents"),
+                DispatchResult(9, DispatchMode.REASON, ProjectStatus.RUNNING, "planned 0 intents"),
+            ],
+            max_steps=1,
+        )
+        self.assertEqual(_ScriptedDispatcher.calls, 3)
+        self.assertEqual(state.last_message, "reason made no progress")
+
+    def test_successful_plan_runs_one_trailing_explore_at_budget(self) -> None:
+        state = self._start(
+            [
+                DispatchResult(9, DispatchMode.EXPLORE, ProjectStatus.RUNNING, "executed 1 intents, released 0"),
+                DispatchResult(9, DispatchMode.REASON, ProjectStatus.RUNNING, "planned 2 intents"),
+                DispatchResult(9, DispatchMode.EXPLORE, ProjectStatus.RUNNING, "executed 2 intents, released 0"),
+            ],
+            max_steps=2,
+        )
+        self.assertEqual(_ScriptedDispatcher.calls, 3)
+        self.assertEqual(state.last_message, "executed 2 intents, released 0")
+
 
 
 if __name__ == "__main__":

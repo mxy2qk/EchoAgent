@@ -8,7 +8,11 @@ from typing import Iterable, Mapping
 
 from echo_agent.dispatcher.agents import CodexDockerAgent, CodexReasoner, CodexWorker
 from echo_agent.dispatcher.client import ProjectClient
-from echo_agent.dispatcher.parsing import _optional_fact_description, strip_prompt_template_text
+from echo_agent.dispatcher.parsing import (
+    _optional_fact_description,
+    is_template_reason_intent,
+    strip_prompt_template_text,
+)
 from echo_agent.dispatcher.prompts import PromptBuilder
 from echo_agent.dispatcher.types import (
     AgentAdapter,
@@ -32,6 +36,20 @@ from echo_agent.models import (
     action_keys_equivalent,
     descriptions_equivalent,
 )
+
+
+def step_consumes_budget(result: DispatchResult) -> bool:
+    message = result.message or ""
+    if message.startswith("planned 0"):
+        return False
+    if message in {"reason failed; will retry", "reason skipped"}:
+        return False
+    return True
+
+
+def step_requests_trailing_explore(result: DispatchResult) -> bool:
+    message = result.message or ""
+    return message.startswith("planned ") and not message.startswith("planned 0")
 
 
 class Dispatcher:
@@ -82,6 +100,7 @@ class Dispatcher:
         self._retry_counts: dict[int, int] = {}
         self._reason_failures = 0
         self._no_progress_reasons = 0
+        self._target_offline_streak = 0
         if agent is None:
             agent = CodexDockerAgent(
                 codex_command=codex_command,
@@ -122,20 +141,31 @@ class Dispatcher:
         interval_seconds: float = 3.0,
         max_steps: int | None = None,
     ) -> list[DispatchResult]:
-        results: list[DispatchResult] = []
-        steps = 0
         if max_steps == 0:
+            return []
+        results: list[DispatchResult] = []
+        try:
+            steps = 0
+            while max_steps is None or steps < max_steps:
+                if self._stop_event.is_set():
+                    break
+                project = self.client.get_project(project_id)
+                result = self._run_project_step(project, release_project=False)
+                results.append(result)
+                if result.mode in {DispatchMode.COMPLETED, DispatchMode.SKIPPED} or self._stop_event.is_set():
+                    break
+                if step_consumes_budget(result):
+                    steps += 1
+                    if max_steps is not None and steps >= max_steps:
+                        self._append_trailing_explore(project_id, result, results)
+                        break
+                time.sleep(interval_seconds)
             return results
-        while max_steps is None or steps < max_steps:
-            project = self.client.get_project(project_id)
-            result = self._run_project_step(project, release_project=False)
-            results.append(result)
-            steps += 1
-            if result.mode in {DispatchMode.COMPLETED, DispatchMode.SKIPPED}:
-                break
-            time.sleep(interval_seconds)
-        self._release_project_if_running(project_id)
-        return results
+        finally:
+            try:
+                self._release_project_if_running(project_id)
+            except Exception:
+                pass
 
     def _run_project_step(self, project: Project, release_project: bool) -> DispatchResult:
         if project.is_completed:
@@ -195,6 +225,10 @@ class Dispatcher:
             "info" if not result.retryable else "warning",
             {"intent_id": intent.id, "retryable": result.retryable},
         )
+        self._observe_target(item.result)
+        offline = self._target_offline_result(project)
+        if offline is not None:
+            return offline
         return DispatchResult(project.id, DispatchMode.FIRST_RUN, project.status, "initial intent executed")
 
     def _explore(
@@ -213,6 +247,7 @@ class Dispatcher:
 
         finished_count = 0
         released_count = 0
+        finished_items: list[IntentExecutionResult] = []
         for item in self._execute_intents(project, intents):
             try:
                 self._commit_intent_result(project, item)
@@ -245,6 +280,9 @@ class Dispatcher:
                     "retryable": item.result.retryable,
                 },
             )
+            finished_items.append(item)
+        for item in sorted(finished_items, key=lambda finished: finished.intent.id):
+            self._observe_target(item.result)
 
         with self._state_lock:
             self._persist_step(project, release_project=release_project)
@@ -253,6 +291,9 @@ class Dispatcher:
             f"explore finished {finished_count} intents, released {released_count}",
             "info",
         )
+        offline = self._target_offline_result(project)
+        if offline is not None:
+            return offline
         return DispatchResult(
             project.id,
             mode,
@@ -314,7 +355,7 @@ class Dispatcher:
         skipped_from = 0
         for item in planned_intents:
             description = str(item.get("description", "")).strip()
-            if not description:
+            if not description or is_template_reason_intent(item):
                 continue
             raw_from = item.get("from")
             if raw_from is None:
@@ -480,7 +521,7 @@ class Dispatcher:
             return
         if len(tail) > cls._PARTIAL_OUTPUT_LIMIT:
             tail = tail[-cls._PARTIAL_OUTPUT_LIMIT:]
-        project.add_fact(f"{cls._PARTIAL_OUTPUT_PREFIX}\n{tail}", kind=FactKind.EVIDENCE)
+        project.add_fact(f"{cls._PARTIAL_OUTPUT_PREFIX}\n{tail}", kind=FactKind.ERROR)
 
     @staticmethod
     def _is_goal_or_evidence(project: Project, fact_id: int) -> bool:
@@ -621,6 +662,9 @@ class Dispatcher:
             "bad gateway",
             "service unavailable",
             "gateway timeout",
+            "high demand",
+            "stream disconnected",
+            "disconnected before completion",
         )
         if any(marker in text for marker in markers):
             return True
@@ -851,14 +895,20 @@ class Dispatcher:
         intent.mark_completed()
 
     @staticmethod
+    def _dispatch_mode(project: Project) -> DispatchMode:
+        if project.is_first_run:
+            return DispatchMode.FIRST_RUN
+        if project.active_intents():
+            return DispatchMode.EXPLORE
+        return DispatchMode.REASON
+
+    @staticmethod
     def _enter_running(project: Project) -> DispatchMode:
         if project.status == ProjectStatus.ACTIVE:
-            mode = DispatchMode.FIRST_RUN if project.is_first_run else DispatchMode.EXPLORE
             project.start()
-            return mode
-        if project.status == ProjectStatus.STOPED:
+        elif project.status == ProjectStatus.STOPED:
             project.start()
-        return DispatchMode.FIRST_RUN if project.is_first_run else DispatchMode.EXPLORE
+        return Dispatcher._dispatch_mode(project)
 
     @staticmethod
     def _complete_project(project: Project) -> None:
@@ -880,6 +930,43 @@ class Dispatcher:
     def _release_project(project: Project) -> None:
         if project.status == ProjectStatus.RUNNING:
             project.stop()
+
+    def _append_trailing_explore(
+        self,
+        project_id: int,
+        result: DispatchResult,
+        results: list[DispatchResult],
+    ) -> None:
+        if not step_requests_trailing_explore(result) or self._stop_event.is_set():
+            return
+        project = self.client.get_project(project_id)
+        if not project.active_intents():
+            return
+        results.append(self._run_project_step(project, release_project=False))
+
+    def _observe_target(self, result: WorkerResult) -> None:
+        parts: list[str] = []
+        for value in (result.fact_description, result.detail, result.answer):
+            if value:
+                parts.append(value)
+        for prior in result.prior_results:
+            for value in (prior.fact_description, prior.answer):
+                if value:
+                    parts.append(value)
+        text = " ".join(parts).strip().lower()
+        if not text:
+            return
+        if "target not found" in text:
+            self._target_offline_streak += 1
+            return
+        self._target_offline_streak = 0
+
+    def _target_offline_result(self, project: Project) -> DispatchResult | None:
+        if self._target_offline_streak < 3:
+            return None
+        message = "target appears offline: target not found repeated 3 times"
+        self._log(project.id, message, "error", {"streak": self._target_offline_streak})
+        return DispatchResult(project.id, DispatchMode.SKIPPED, project.status, message)
 
     def _release_project_if_running(self, project_id: int) -> None:
         project = self.client.get_project(project_id)

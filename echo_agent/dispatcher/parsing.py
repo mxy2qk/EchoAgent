@@ -5,6 +5,17 @@ from typing import Literal
 
 from echo_agent.dispatcher.types import ReasonResult, WorkerObservation, WorkerResult
 
+TEMPLATE_REASON_INTENTS: tuple[tuple[str, str], ...] = (
+    ("check-upload", "分析是否存在文件上传漏洞"),
+    ("enum-backup", "枚举 Web 目录和敏感备份文件"),
+)
+
+
+def is_template_reason_intent(item: dict[str, object]) -> bool:
+    description = str(item.get("description") or "").strip()
+    action_key = str(item.get("action_key") or "").strip()
+    return (action_key, description) in TEMPLATE_REASON_INTENTS
+
 
 def parse_worker_result(output: str) -> WorkerResult:
     slices = extract_mode_json_outputs(output, "explore")
@@ -55,10 +66,13 @@ def parse_reason_result(output: str) -> ReasonResult:
     if not isinstance(completed, bool):
         raise ValueError("reason output completed must be a boolean")
     intents = _parse_reason_intents(data)
+    kept = [item for item in intents if not is_template_reason_intent(item)]
+    if intents and not kept and not completed:
+        raise ValueError("reason output only contains prompt template intents")
     return ReasonResult(
         completed=completed,
-        next_intent_descriptions=[str(item["description"]) for item in intents],
-        next_intents=intents,
+        next_intent_descriptions=[str(item["description"]) for item in kept],
+        next_intents=kept,
         answer=_optional_answer(data.get("answer")),
         stop_reason=_optional_reason_text(data.get("stop_reason"), "stop_reason"),
         raw_output=output,

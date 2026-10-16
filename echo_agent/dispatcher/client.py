@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from echo_agent.models import Project
@@ -135,14 +136,38 @@ class ProjectClient:
             method=method,
             headers={"Content-Type": "application/json"},
         )
-        try:
-            with urlopen(request, timeout=10) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            raw = exc.read().decode("utf-8")
+        last_error: URLError | None = None
+        for attempt in range(3):
             try:
-                data = json.loads(raw)
-                detail = data.get("error", data.get("detail", raw))
-            except json.JSONDecodeError:
-                detail = raw
-            raise ProjectAPIError(f"{method} {path} failed: {exc.code} {detail}") from exc
+                with urlopen(request, timeout=10) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except HTTPError as exc:
+                raw = exc.read().decode("utf-8")
+                try:
+                    data = json.loads(raw)
+                    detail = data.get("error", data.get("detail", raw))
+                except json.JSONDecodeError:
+                    detail = raw
+                raise ProjectAPIError(f"{method} {path} failed: {exc.code} {detail}") from exc
+            except URLError as exc:
+                last_error = exc
+                if attempt >= 2 or not _is_transient_url_error(exc):
+                    break
+                time.sleep(0.2 * (attempt + 1))
+        reason = last_error.reason if last_error is not None else "request failed"
+        raise ProjectAPIError(f"{method} {path} failed: {reason}") from last_error
+
+
+def _is_transient_url_error(exc: URLError) -> bool:
+    reason = exc.reason
+    text = f"{exc} {reason} {getattr(reason, 'errno', '')}".lower()
+    markers = (
+        "timed out",
+        "timeout",
+        "connection refused",
+        "connection reset",
+        "10048",
+        "address already in use",
+        "只允许使用一次",
+    )
+    return any(marker in text for marker in markers)

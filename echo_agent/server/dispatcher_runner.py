@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from echo_agent.config import DispatcherSettings
 from echo_agent.dispatcher import Dispatcher
+from echo_agent.dispatcher.core import step_consumes_budget, step_requests_trailing_explore
 from echo_agent.models import Project, ProjectStatus
 from echo_agent.server.docker_runtime import DockerProjectRuntime, DockerRuntimeError
 from echo_agent.storage import SQLiteProjectStore
@@ -166,6 +167,7 @@ class DispatcherRunner:
         if stop_event.is_set():
             dispatcher.request_stop()
         steps = 0
+        observed = 0
         try:
             client.add_project_log(
                 project_id,
@@ -189,18 +191,44 @@ class DispatcherRunner:
                     stop_event.wait(interval_seconds)
                     continue
                 consecutive_failures = 0
+                observed += 1
+                if step_consumes_budget(result):
+                    steps += 1
                 state.last_message = result.message
-                steps += 1
                 client.add_project_log(
                     project_id,
-                    f"server dispatcher step {steps} finished",
+                    f"server dispatcher step {observed} finished",
                     metadata={
                         "mode": result.mode.value,
                         "status": result.status.value,
                         "message": result.message,
+                        "budget_steps": steps,
                     },
                 )
                 if result.mode.value in {"completed", "skipped"}:
+                    break
+                if step_consumes_budget(result) and max_steps is not None and steps >= max_steps:
+                    if step_requests_trailing_explore(result) and not stop_event.is_set():
+                        try:
+                            trailing = dispatcher.run_once(project_id, release_project=False)
+                        except Exception as exc:
+                            state.last_message = f"{type(exc).__name__}: {exc}"
+                            client.add_project_log(project_id, state.last_message, level="error")
+                        else:
+                            observed += 1
+                            state.last_message = trailing.message
+                            client.add_project_log(
+                                project_id,
+                                f"server dispatcher step {observed} finished",
+                                metadata={
+                                    "mode": trailing.mode.value,
+                                    "status": trailing.status.value,
+                                    "message": trailing.message,
+                                    "budget_steps": steps,
+                                    "trailing_explore": True,
+                                },
+                            )
+                        break
                     break
                 stop_event.wait(interval_seconds)
         except Exception as exc:
@@ -209,7 +237,11 @@ class DispatcherRunner:
         finally:
             dispatcher._release_project_if_running(project_id)
             state.running = False
-            client.add_project_log(project_id, "server dispatcher stopped", metadata={"steps": steps})
+            client.add_project_log(
+                project_id,
+                "server dispatcher stopped",
+                metadata={"steps": observed, "budget_steps": steps},
+            )
 
 class StoreDispatcherClient:
     def __init__(self, store: SQLiteProjectStore, runtime: DockerProjectRuntime | None = None) -> None:
