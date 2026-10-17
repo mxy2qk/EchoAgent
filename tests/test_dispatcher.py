@@ -7,6 +7,7 @@ import unittest
 from typing import Any
 
 from echo_agent.dispatcher.core import Dispatcher
+from echo_agent.dispatcher.parsing import ReasonFormatError
 from echo_agent.dispatcher.prompts import PromptBuilder
 from echo_agent.dispatcher.types import DispatchMode, ReasonResult, WorkerObservation, WorkerResult
 from echo_agent.models import (
@@ -626,6 +627,18 @@ class RaisingReasoner:
     def plan(self, project: Project) -> ReasonResult:
         self.calls += 1
         raise RuntimeError("HTTP 503 service unavailable")
+
+
+class FormatErrorReasoner:
+    def __init__(self, succeed_on: int | None = None) -> None:
+        self.calls = 0
+        self.succeed_on = succeed_on
+
+    def plan(self, project: Project) -> ReasonResult:
+        self.calls += 1
+        if self.succeed_on is not None and self.calls >= self.succeed_on:
+            return ReasonResult(completed=False, next_intents=[])
+        raise ReasonFormatError("reason output does not contain a JSON object")
 
 
 class ExplodingReasoner:
@@ -1489,6 +1502,71 @@ class OuterLoopFixTests(unittest.TestCase):
         self.assertIn("outcome=refuted", prompt)
         self.assertIn("检查上传点", prompt)
 
+
+class FormatAndExcerptTests(unittest.TestCase):
+    def test_reason_format_error_retries_without_counting_as_infrastructure_failure(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        reasoner = FormatErrorReasoner()
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=reasoner,  # type: ignore[arg-type]
+            max_retryable_attempts=2,
+        )
+
+        results = dispatcher.run_loop(project.id, interval_seconds=0, max_steps=1)
+
+        self.assertEqual(reasoner.calls, 4)
+        self.assertEqual(results[0].message, "reason output was not JSON; will retry")
+        self.assertEqual(results[-1].mode, DispatchMode.SKIPPED)
+        self.assertIn("never a valid JSON object", results[-1].message)
+        self.assertNotIn("reason failed repeatedly", [result.message for result in results])
+
+    def test_reason_format_error_accepts_the_immediate_retry(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        reasoner = FormatErrorReasoner(succeed_on=2)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=reasoner,  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id, release_project=False)
+
+        self.assertEqual(reasoner.calls, 2)
+        self.assertEqual(result.message, "planned 0 intents")
+        self.assertEqual(dispatcher._reason_format_failures, 0)
+
+    def test_partial_output_excerpt_cannot_satisfy_completion(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        project.add_fact(
+            "未完成执行的输出摘录：\nflag{reason}",
+            kind=FactKind.EVIDENCE,
+        )
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=FlagReasoner(),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id, release_project=False)
+
+        self.assertNotEqual(result.mode, DispatchMode.COMPLETED)
+        self.assertNotEqual(client.project.status, ProjectStatus.COMPLETED)
+
+    def test_json_parse_failure_and_upstream_overload_are_retryable(self) -> None:
+        self.assertTrue(
+            Dispatcher._is_retryable_failure(RuntimeError("explore output does not contain a JSON object"))
+        )
+        self.assertTrue(
+            Dispatcher._is_retryable_failure(
+                RuntimeError("codex agent transient upstream failure in explore mode with exit code 1")
+            )
+        )
+        self.assertTrue(Dispatcher._is_retryable_failure(RuntimeError("provider overloaded, reconnecting")))
 
 
 if __name__ == "__main__":

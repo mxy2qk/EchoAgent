@@ -56,6 +56,9 @@ class DispatcherSettings:
     codex_reason_model: str | None = None
     codex_workspace: str
     codex_timeout_seconds: int
+    codex_first_run_timeout_seconds: int
+    codex_explore_timeout_seconds: int
+    codex_reason_timeout_seconds: int
     codex_no_output_timeout_seconds: int
     codex_first_run_no_output_timeout_seconds: int
     codex_explore_no_output_timeout_seconds: int
@@ -127,6 +130,33 @@ class DispatcherSettings:
                     "codex",
                     "timeout_seconds",
                 )
+            ),
+            codex_first_run_timeout_seconds=int(
+                _optional_config_setting(
+                    "ECHO_AGENT_CODEX_FIRST_RUN_TIMEOUT",
+                    config,
+                    "codex",
+                    "first_run_timeout_seconds",
+                )
+                or _setting("ECHO_AGENT_CODEX_TIMEOUT", config, "codex", "timeout_seconds")
+            ),
+            codex_explore_timeout_seconds=int(
+                _optional_config_setting(
+                    "ECHO_AGENT_CODEX_EXPLORE_TIMEOUT",
+                    config,
+                    "codex",
+                    "explore_timeout_seconds",
+                )
+                or _setting("ECHO_AGENT_CODEX_TIMEOUT", config, "codex", "timeout_seconds")
+            ),
+            codex_reason_timeout_seconds=int(
+                _optional_config_setting(
+                    "ECHO_AGENT_CODEX_REASON_TIMEOUT",
+                    config,
+                    "codex",
+                    "reason_timeout_seconds",
+                )
+                or _setting("ECHO_AGENT_CODEX_TIMEOUT", config, "codex", "timeout_seconds")
             ),
             codex_no_output_timeout_seconds=int(
                 _setting(
@@ -243,6 +273,14 @@ class DispatcherSettings:
             "first_run": self.codex_first_run_no_output_timeout_seconds,
             "explore": self.codex_explore_no_output_timeout_seconds,
             "reason": self.codex_reason_no_output_timeout_seconds,
+        }
+
+    @property
+    def codex_mode_timeout_seconds(self) -> dict[str, int]:
+        return {
+            "first_run": self.codex_first_run_timeout_seconds,
+            "explore": self.codex_explore_timeout_seconds,
+            "reason": self.codex_reason_timeout_seconds,
         }
 
 

@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from echo_agent.dispatcher.parsing import extract_mode_json_output, extract_mode_json_outputs, parse_reason_result, parse_worker_result
+from echo_agent.dispatcher.parsing import (
+    ReasonFormatError,
+    extract_mode_json_output,
+    extract_mode_json_outputs,
+    parse_reason_result,
+    parse_worker_result,
+)
 
 
 class DispatcherParsingTests(unittest.TestCase):
@@ -278,6 +284,27 @@ class DispatcherParsingTests(unittest.TestCase):
         empty = {"completed": False, "next_intents": []}
         result = parse_reason_result(json.dumps(empty, ensure_ascii=False))
         self.assertEqual(result.next_intents, [])
+
+    def test_reason_output_without_json_is_a_format_error(self) -> None:
+        with self.assertRaises(ReasonFormatError):
+            parse_reason_result("我先分析一下，暂时不给 JSON")
+
+    def test_reason_template_match_ignores_key_case_and_extra_space(self) -> None:
+        import json
+
+        payload = {
+            "completed": False,
+            "next_intents": [
+                {
+                    "from": 2,
+                    "to": None,
+                    "action_key": "CHECK_UPLOAD",
+                    "description": "  分析是否存在文件上传漏洞  ",
+                }
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "prompt template intents"):
+            parse_reason_result(json.dumps(payload, ensure_ascii=False))
 
 
 

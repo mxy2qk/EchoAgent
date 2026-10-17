@@ -4,6 +4,7 @@ import json
 from typing import Literal
 
 from echo_agent.dispatcher.types import ReasonResult, WorkerObservation, WorkerResult
+from echo_agent.models import normalize_action_key
 
 TEMPLATE_REASON_INTENTS: tuple[tuple[str, str], ...] = (
     ("check-upload", "分析是否存在文件上传漏洞"),
@@ -11,9 +12,16 @@ TEMPLATE_REASON_INTENTS: tuple[tuple[str, str], ...] = (
 )
 
 
+class ReasonFormatError(ValueError):
+    """reason 输出里没有可解析的 JSON 对象。
+
+    这是模型输出格式问题，不应当累计成基础设施失败。
+    """
+
+
 def is_template_reason_intent(item: dict[str, object]) -> bool:
-    description = str(item.get("description") or "").strip()
-    action_key = str(item.get("action_key") or "").strip()
+    description = " ".join(str(item.get("description") or "").split())
+    action_key = normalize_action_key(item.get("action_key"))
     return (action_key, description) in TEMPLATE_REASON_INTENTS
 
 
@@ -82,6 +90,8 @@ def parse_reason_result(output: str) -> ReasonResult:
 def _parse_json_object(output: str, mode: Literal["explore", "reason"]) -> dict[str, object]:
     matches = _matching_json_objects(output, mode)
     if not matches:
+        if mode == "reason":
+            raise ReasonFormatError("reason output does not contain a JSON object")
         raise ValueError(f"{mode} output does not contain a JSON object")
     data = matches[-1]
     if not isinstance(data, dict):

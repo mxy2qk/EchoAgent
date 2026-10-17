@@ -9,6 +9,7 @@ from typing import Iterable, Mapping
 from echo_agent.dispatcher.agents import CodexDockerAgent, CodexReasoner, CodexWorker
 from echo_agent.dispatcher.client import ProjectClient
 from echo_agent.dispatcher.parsing import (
+    ReasonFormatError,
     _optional_fact_description,
     is_template_reason_intent,
     strip_prompt_template_text,
@@ -42,7 +43,11 @@ def step_consumes_budget(result: DispatchResult) -> bool:
     message = result.message or ""
     if message.startswith("planned 0"):
         return False
-    if message in {"reason failed; will retry", "reason skipped"}:
+    if message in {
+        "reason failed; will retry",
+        "reason output was not JSON; will retry",
+        "reason skipped",
+    }:
         return False
     return True
 
@@ -75,6 +80,7 @@ class Dispatcher:
         codex_timeout_seconds: int = 1800,
         codex_no_output_timeout_seconds: int = 900,
         codex_mode_no_output_timeout_seconds: Mapping[DispatchMode | str, int] | None = None,
+        codex_mode_timeout_seconds: Mapping[DispatchMode | str, int] | None = None,
         openai_api_key: str | None = None,
         openai_base_url: str | None = None,
         codex_command: tuple[str, ...] | None = None,
@@ -99,6 +105,7 @@ class Dispatcher:
         self._state_lock = threading.Lock()
         self._retry_counts: dict[int, int] = {}
         self._reason_failures = 0
+        self._reason_format_failures = 0
         self._no_progress_reasons = 0
         self._target_offline_streak = 0
         if agent is None:
@@ -110,6 +117,7 @@ class Dispatcher:
                 timeout_seconds=codex_timeout_seconds,
                 no_output_timeout_seconds=codex_no_output_timeout_seconds,
                 mode_no_output_timeout_seconds=codex_mode_no_output_timeout_seconds,
+                mode_timeout_seconds=codex_mode_timeout_seconds,
                 openai_api_key=openai_api_key,
                 openai_base_url=openai_base_url,
                 provider_name=codex_provider_name,
@@ -309,15 +317,28 @@ class Dispatcher:
             return DispatchResult(project.id, DispatchMode.REASON, project.status, "reason skipped")
         try:
             try:
-                if self._reasoner_accepts_log:
-                    result = self.reasoner.plan(project, log=self._agent_log(project.id))  # type: ignore[call-arg]
-                else:
-                    result = self.reasoner.plan(project)
+                result = self._call_reasoner(project)
+            except ReasonFormatError as exc:
+                self._log(
+                    project.id,
+                    f"reason output was not a JSON object; retrying once: {exc}",
+                    "warning",
+                    {"error": str(exc)},
+                )
+                try:
+                    result = self._call_reasoner(project)
+                except ReasonFormatError as retry_exc:
+                    return self._reason_format_failure(
+                        project,
+                        retry_exc,
+                        release_project=release_project,
+                    )
             except Exception as exc:
                 return self._reason_failure_result(project, exc, release_project=release_project)
         finally:
             self._model_slots.release()
         self._reason_failures = 0
+        self._reason_format_failures = 0
         if result.completed:
             if any(intent.status == IntentStatus.RUNNING for intent in project.intents.values()):
                 recovered = self._recover_stranded_intents(project)
@@ -536,7 +557,9 @@ class Dispatcher:
         if not text:
             return False
         return any(
-            fact.kind == FactKind.EVIDENCE and text in fact.description
+            fact.kind == FactKind.EVIDENCE
+            and not fact.description.startswith(Dispatcher._PARTIAL_OUTPUT_PREFIX)
+            and text in fact.description
             for fact in project.facts.values()
         )
 
@@ -663,8 +686,12 @@ class Dispatcher:
             "service unavailable",
             "gateway timeout",
             "high demand",
+            "overloaded",
             "stream disconnected",
+            "reconnecting",
             "disconnected before completion",
+            "does not contain a json object",
+            "transient upstream failure",
         )
         if any(marker in text for marker in markers):
             return True
@@ -813,6 +840,41 @@ class Dispatcher:
             )
         return DispatchResult(project.id, DispatchMode.REASON, project.status, "reason failed; will retry")
 
+    def _call_reasoner(self, project: Project) -> ReasonResult:
+        if self._reasoner_accepts_log:
+            return self.reasoner.plan(project, log=self._agent_log(project.id))  # type: ignore[call-arg]
+        return self.reasoner.plan(project)
+
+    def _reason_format_failure(
+        self,
+        project: Project,
+        exc: Exception,
+        release_project: bool,
+    ) -> DispatchResult:
+        self._reason_format_failures += 1
+        fatal = self._reason_format_failures >= self.max_retryable_attempts
+        self._log(
+            project.id,
+            f"reason output was not a JSON object (format failure "
+            f"{self._reason_format_failures}/{self.max_retryable_attempts})",
+            "error" if fatal else "warning",
+            {"attempt": self._reason_format_failures, "error": str(exc)},
+        )
+        self._persist_step(project, release_project=release_project)
+        if fatal and not self._stop_event.is_set():
+            return DispatchResult(
+                project.id,
+                DispatchMode.SKIPPED,
+                project.status,
+                f"reason output was never a valid JSON object: {exc}",
+            )
+        return DispatchResult(
+            project.id,
+            DispatchMode.REASON,
+            project.status,
+            "reason output was not JSON; will retry",
+        )
+
     def _is_duplicate_intent(
         self,
         project: Project,
@@ -874,7 +936,9 @@ class Dispatcher:
             (
                 fact
                 for fact in sorted(project.facts.values(), key=lambda item: item.id, reverse=True)
-                if fact.kind == FactKind.EVIDENCE and answer_text in fact.description
+                if fact.kind == FactKind.EVIDENCE
+                and not fact.description.startswith(Dispatcher._PARTIAL_OUTPUT_PREFIX)
+                and answer_text in fact.description
             ),
             None,
         )
