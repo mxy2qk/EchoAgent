@@ -7,6 +7,10 @@
 host = "127.0.0.1"
 port = 8000
 
+# Optional API token. When set, /projects* requires header X-Echo-Agent-Token.
+# Recommended: workers run in Docker and can otherwise reach this API from the host.
+# auth_token = ""
+
 # SQLite database path. Runtime state under .echo_agent/ should not be committed.
 database_path = ".echo_agent/echo_agent.db"
 

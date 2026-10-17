@@ -61,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    client = ProjectClient(args.server_url)
+    client = ProjectClient(args.server_url, auth_token=DispatcherSettings.from_env().server_auth_token)
 
     if args.command == "create-project":
         project = client.create_project(

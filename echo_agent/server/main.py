@@ -6,4 +6,4 @@ from echo_agent.storage import SQLiteProjectStore
 
 
 settings = ServerSettings.from_env()
-app = create_app(SQLiteProjectStore(settings.database_path))
+app = create_app(SQLiteProjectStore(settings.database_path), auth_token=settings.auth_token)

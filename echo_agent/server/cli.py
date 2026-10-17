@@ -20,7 +20,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    app = create_app(SQLiteProjectStore(args.db))
+    settings = ServerSettings.from_env()
+    app = create_app(SQLiteProjectStore(args.db), auth_token=settings.auth_token)
     uvicorn.run(app, host=args.host, port=args.port)
     return 0
 
