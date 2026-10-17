@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from echo_agent.models import Project
@@ -10,6 +11,12 @@ from echo_agent.models import Project
 
 class ProjectAPIError(RuntimeError):
     pass
+
+
+# 本机 HTTP 调用的瞬时故障（典型如 Windows 临时端口耗尽 WinError 10048）不该让整个
+# run-loop 裸退，退避重试即可恢复。
+_REQUEST_ATTEMPTS = 3
+_REQUEST_BACKOFF_SECONDS = 0.5
 
 
 class ProjectClient:
@@ -135,14 +142,25 @@ class ProjectClient:
             method=method,
             headers={"Content-Type": "application/json"},
         )
-        try:
-            with urlopen(request, timeout=10) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            raw = exc.read().decode("utf-8")
+        last_error: Exception | None = None
+        for attempt in range(1, _REQUEST_ATTEMPTS + 1):
             try:
-                data = json.loads(raw)
-                detail = data.get("error", data.get("detail", raw))
-            except json.JSONDecodeError:
-                detail = raw
-            raise ProjectAPIError(f"{method} {path} failed: {exc.code} {detail}") from exc
+                with urlopen(request, timeout=10) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except HTTPError as exc:
+                # HTTPError 是 URLError 的子类，必须排在前面：服务端明确返回的错误码不重试。
+                raw = exc.read().decode("utf-8")
+                try:
+                    data = json.loads(raw)
+                    detail = data.get("error", data.get("detail", raw))
+                except json.JSONDecodeError:
+                    detail = raw
+                raise ProjectAPIError(f"{method} {path} failed: {exc.code} {detail}") from exc
+            except URLError as exc:
+                last_error = exc
+                if attempt >= _REQUEST_ATTEMPTS:
+                    break
+                time.sleep(_REQUEST_BACKOFF_SECONDS * attempt)
+        raise ProjectAPIError(
+            f"{method} {path} failed after {_REQUEST_ATTEMPTS} attempts: {last_error}"
+        ) from last_error

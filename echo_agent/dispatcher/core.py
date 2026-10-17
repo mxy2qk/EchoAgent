@@ -8,7 +8,7 @@ from typing import Iterable, Mapping
 
 from echo_agent.dispatcher.agents import CodexDockerAgent, CodexReasoner, CodexWorker
 from echo_agent.dispatcher.client import ProjectClient
-from echo_agent.dispatcher.parsing import _optional_fact_description, strip_prompt_template_text
+from echo_agent.dispatcher.parsing import ReasonFormatError, _optional_fact_description, strip_prompt_template_text
 from echo_agent.dispatcher.prompts import PromptBuilder
 from echo_agent.dispatcher.types import (
     AgentAdapter,
@@ -57,6 +57,7 @@ class Dispatcher:
         codex_timeout_seconds: int = 1800,
         codex_no_output_timeout_seconds: int = 900,
         codex_mode_no_output_timeout_seconds: Mapping[DispatchMode | str, int] | None = None,
+        codex_mode_timeout_seconds: Mapping[DispatchMode | str, int] | None = None,
         openai_api_key: str | None = None,
         openai_base_url: str | None = None,
         codex_command: tuple[str, ...] | None = None,
@@ -81,6 +82,7 @@ class Dispatcher:
         self._state_lock = threading.Lock()
         self._retry_counts: dict[int, int] = {}
         self._reason_failures = 0
+        self._reason_format_failures = 0
         self._no_progress_reasons = 0
         if agent is None:
             agent = CodexDockerAgent(
@@ -91,6 +93,7 @@ class Dispatcher:
                 timeout_seconds=codex_timeout_seconds,
                 no_output_timeout_seconds=codex_no_output_timeout_seconds,
                 mode_no_output_timeout_seconds=codex_mode_no_output_timeout_seconds,
+                mode_timeout_seconds=codex_mode_timeout_seconds,
                 openai_api_key=openai_api_key,
                 openai_base_url=openai_base_url,
                 provider_name=codex_provider_name,
@@ -127,14 +130,27 @@ class Dispatcher:
         if max_steps == 0:
             return results
         while max_steps is None or steps < max_steps:
-            project = self.client.get_project(project_id)
-            result = self._run_project_step(project, release_project=False)
+            try:
+                project = self.client.get_project(project_id)
+                result = self._run_project_step(project, release_project=False)
+            except Exception as exc:
+                # 单步意外失败不应让 run-loop 裸退、把项目留在 running/容器不释放。
+                self._log(
+                    project_id,
+                    f"run loop step failed: {type(exc).__name__}: {exc}",
+                    "error",
+                )
+                break
             results.append(result)
             steps += 1
             if result.mode in {DispatchMode.COMPLETED, DispatchMode.SKIPPED}:
                 break
             time.sleep(interval_seconds)
-        self._release_project_if_running(project_id)
+        try:
+            self._release_project_if_running(project_id)
+        except Exception:
+            # 收尾尽力而为：释放失败不能遮蔽上面的原始失败原因。
+            pass
         return results
 
     def _run_project_step(self, project: Project, release_project: bool) -> DispatchResult:
@@ -157,7 +173,15 @@ class Dispatcher:
         recovered = self._recover_stranded_intents(project)
         mode = self._enter_running(project)
         self.client.save_project(project)
-        self._log(project.id, f"project entered {mode.value} mode", "info", {"status": project.status.value})
+        # 日志要反映**实际**要走的分支：_enter_running 只会返回 first_run/explore，
+        # 直接用它打印会让 reason 步也显示 "entered explore mode"（BUG-003）。
+        if project.is_first_run:
+            actual_mode = DispatchMode.FIRST_RUN
+        elif project.active_intents():
+            actual_mode = DispatchMode.EXPLORE
+        else:
+            actual_mode = DispatchMode.REASON
+        self._log(project.id, f"project entered {actual_mode.value} mode", "info", {"status": project.status.value})
         if recovered:
             self._log(
                 project.id,
@@ -268,15 +292,27 @@ class Dispatcher:
             return DispatchResult(project.id, DispatchMode.REASON, project.status, "reason skipped")
         try:
             try:
-                if self._reasoner_accepts_log:
-                    result = self.reasoner.plan(project, log=self._agent_log(project.id))  # type: ignore[call-arg]
-                else:
-                    result = self.reasoner.plan(project)
+                result = self._call_reasoner(project)
+            except ReasonFormatError as exc:
+                # 模型的**输出格式**问题（只给了推理散文、没给 JSON），不是基础设施故障。
+                # 先就地重采样一次；仍失败才计入格式失败计数。
+                self._log(
+                    project.id,
+                    f"reason output was not a JSON object; retrying once: {exc}",
+                    "warning",
+                    {"error": str(exc)},
+                )
+                try:
+                    result = self._call_reasoner(project)
+                except ReasonFormatError as retry_exc:
+                    return self._reason_format_failure(project, retry_exc, release_project=release_project)
+                self._reason_format_failures = 0
             except Exception as exc:
                 return self._reason_failure_result(project, exc, release_project=release_project)
         finally:
             self._model_slots.release()
         self._reason_failures = 0
+        self._reason_format_failures = 0
         if result.completed:
             if any(intent.status == IntentStatus.RUNNING for intent in project.intents.values()):
                 recovered = self._recover_stranded_intents(project)
@@ -494,8 +530,12 @@ class Dispatcher:
         text = answer.strip()
         if not text:
             return False
+        # 只认可**已验证事实**里的答案；超时/中断留下的输出摘录不是结论，
+        # 即使里面碰巧出现答案字符串，也不能据此判定项目完成（BUG-002/005）。
         return any(
-            fact.kind == FactKind.EVIDENCE and text in fact.description
+            fact.kind == FactKind.EVIDENCE
+            and not fact.description.startswith(Dispatcher._PARTIAL_OUTPUT_PREFIX)
+            and text in fact.description
             for fact in project.facts.values()
         )
 
@@ -621,6 +661,16 @@ class Dispatcher:
             "bad gateway",
             "service unavailable",
             "gateway timeout",
+            # 上游过载 / 流中断：属瞬时故障，重试即可（BUG-010）。
+            "high demand",
+            "overloaded",
+            "stream disconnected",
+            "reconnecting",
+            # 模型没给出 JSON 对象属**输出格式**问题而非故障，同样先重试一次，
+            # 由 _consume_retry_budget 兜住次数（BUG-011 的 explore 侧）。
+            "does not contain a json object",
+            # agents.py 命中上游瞬时错误时抛出的固定短语（BUG-010）。
+            "transient upstream failure",
         )
         if any(marker in text for marker in markers):
             return True
@@ -744,6 +794,47 @@ class Dispatcher:
                 f"intent {item.intent.id}",
                 RuntimeError(detail),
             ),
+        )
+
+    def _call_reasoner(self, project: Project):
+        if self._reasoner_accepts_log:
+            return self.reasoner.plan(project, log=self._agent_log(project.id))  # type: ignore[call-arg]
+        return self.reasoner.plan(project)
+
+    def _reason_format_failure(
+        self,
+        project: Project,
+        exc: Exception,
+        release_project: bool,
+    ) -> DispatchResult:
+        """reason 输出始终不是可解析的 JSON。
+
+        与 `_reason_failure_result` 的关键区别：这**不计入** `_reason_failures`，
+        因此不会被当作「reason made no progress / reason failed repeatedly」而误判为无解。
+        达到上限时给出明确的终止原因，而不是伪装成「没有进展」。
+        """
+        self._reason_format_failures += 1
+        fatal = self._reason_format_failures >= self.max_retryable_attempts
+        self._log(
+            project.id,
+            f"reason output was not a JSON object (format failure "
+            f"{self._reason_format_failures}/{self.max_retryable_attempts})",
+            "error" if fatal else "warning",
+            {"attempt": self._reason_format_failures, "error": str(exc)},
+        )
+        self._persist_step(project, release_project=release_project)
+        if fatal and not self._stop_event.is_set():
+            return DispatchResult(
+                project.id,
+                DispatchMode.SKIPPED,
+                project.status,
+                f"reason output was never a valid JSON object: {exc}",
+            )
+        return DispatchResult(
+            project.id,
+            DispatchMode.REASON,
+            project.status,
+            "reason output was not JSON; will retry",
         )
 
     def _reason_failure_result(

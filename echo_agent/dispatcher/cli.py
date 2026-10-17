@@ -136,6 +136,7 @@ def _build_dispatcher(client: ProjectClient, args: argparse.Namespace) -> Dispat
         codex_timeout_seconds=settings.codex_timeout_seconds,
         codex_no_output_timeout_seconds=settings.codex_no_output_timeout_seconds,
         codex_mode_no_output_timeout_seconds=settings.codex_mode_no_output_timeout_seconds,
+        codex_mode_timeout_seconds=settings.codex_mode_timeout_seconds,
         openai_api_key=settings.openai_api_key,
         openai_base_url=args.openai_base_url,
         codex_command=settings.codex_command,

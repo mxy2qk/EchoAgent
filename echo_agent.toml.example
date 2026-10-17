@@ -39,6 +39,11 @@ workspace = "/home/kali/workspace"
 # Hard process timeout for one Codex invocation.
 timeout_seconds = 1800
 
+# Optional per-mode overrides of timeout_seconds (fall back to timeout_seconds when unset).
+# first_run_timeout_seconds = 1800
+# explore_timeout_seconds = 1800
+# reason_timeout_seconds = 1800
+
 # Kill Codex if there is no stdout/stderr activity for this many seconds.
 # Set to 0 to disable this idle guard and rely only on timeout_seconds.
 no_output_timeout_seconds = 900

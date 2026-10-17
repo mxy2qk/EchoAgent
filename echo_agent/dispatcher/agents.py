@@ -29,6 +29,22 @@ from echo_agent.dispatcher.types import (
 from echo_agent.models import Intent, Project
 
 
+# 上游过载 / 流中断等**瞬时**错误：重试即可恢复，不应把 intent 直接判死（BUG-010）。
+# 命中这些标记时抛出的异常会带上 "transient upstream failure"，
+# 由调度层 core._is_retryable_failure 识别并走重试预算。
+TRANSIENT_UPSTREAM_MARKERS = (
+    "high demand",
+    "overloaded",
+    "stream disconnected",
+    "reconnecting",
+    "rate limit",
+    "too many requests",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+)
+
+
 class CodexDockerAgent:
     def __init__(
         self,
@@ -46,6 +62,7 @@ class CodexDockerAgent:
         stream_idle_timeout_ms: int = 60_000,
         no_output_timeout_seconds: int = 900,
         mode_no_output_timeout_seconds: Mapping[DispatchMode | str, int] | None = None,
+        mode_timeout_seconds: Mapping[DispatchMode | str, int] | None = None,
     ) -> None:
         self.codex_command = tuple(
             codex_command
@@ -72,6 +89,11 @@ class CodexDockerAgent:
         self.mode_no_output_timeout_seconds = {
             self._mode_key(key): int(value)
             for key, value in (mode_no_output_timeout_seconds or {}).items()
+        }
+        # per-mode 墙钟：未配置的模式回退到全局 timeout_seconds（BUG-005）。
+        self.mode_timeout_seconds = {
+            self._mode_key(key): int(value)
+            for key, value in (mode_timeout_seconds or {}).items()
         }
         self._preflight_lock = threading.Lock()
         self._preflight_ready: set[str] = set()
@@ -372,6 +394,7 @@ class CodexDockerAgent:
         last_activity_count = 0
         activity_count = 0
         no_output_timeout_seconds = self._no_output_timeout_for_mode(mode)
+        timeout_seconds = self._timeout_for_mode(mode)
         while process.poll() is None:
             elapsed = time.monotonic() - started_at
             with output_lock:
@@ -379,7 +402,7 @@ class CodexDockerAgent:
             if current_activity_count != activity_count:
                 activity_count = current_activity_count
                 last_activity_at = time.monotonic()
-            if elapsed > self.timeout_seconds:
+            if elapsed > timeout_seconds:
                 self._kill_process(process)
                 process.wait()
                 stdout_reader.join(timeout=1)
@@ -397,17 +420,17 @@ class CodexDockerAgent:
                         log,
                         f"codex agent timed out in {mode.value} mode, salvaged JSON output",
                         "warning",
-                        {"timeout_seconds": self.timeout_seconds, "output_lines": output_count},
+                        {"timeout_seconds": timeout_seconds, "output_lines": output_count},
                     )
                     return salvaged
                 self._log(
                     log,
                     f"codex agent timed out in {mode.value} mode",
                     "error",
-                    {"timeout_seconds": self.timeout_seconds, "output_lines": output_count, "recent_output": detail},
+                    {"timeout_seconds": timeout_seconds, "output_lines": output_count, "recent_output": detail},
                 )
                 raise RuntimeError(self._timeout_message(
-                    f"codex agent timed out in {mode.value} mode after {self.timeout_seconds}s",
+                    f"codex agent timed out in {mode.value} mode after {timeout_seconds}s",
                     detail or combined,
                 ))
             idle_seconds = time.monotonic() - last_activity_at
@@ -499,10 +522,8 @@ class CodexDockerAgent:
             stderr_output = "\n".join(stderr_lines).strip()
             detail = "\n".join(recent_output).strip()
         if return_code != 0:
-            salvaged_output = self._salvaged_output(
-                "\n".join(item for item in [output, stderr_output] if item),
-                mode,
-            )
+            combined = "\n".join(item for item in [output, stderr_output] if item)
+            salvaged_output = self._salvaged_output(combined, mode)
             if salvaged_output is not None:
                 self._log(
                     log,
@@ -511,6 +532,20 @@ class CodexDockerAgent:
                     {"recent_output": detail},
                 )
                 return salvaged_output
+            if any(marker in combined.lower() for marker in TRANSIENT_UPSTREAM_MARKERS):
+                # 上游过载 / 流中断：属瞬时故障，交给调度层的重试预算处理，
+                # 不要把它当成「这个 intent 本身失败」而永久判死（BUG-010）。
+                self._log(
+                    log,
+                    f"codex agent transient upstream failure in {mode.value} mode "
+                    f"(exit code {return_code})",
+                    "warning",
+                    {"recent_output": detail},
+                )
+                raise RuntimeError(
+                    f"codex agent transient upstream failure in {mode.value} mode "
+                    f"with exit code {return_code}: {detail}"
+                )
             self._log(
                 log,
                 f"codex agent failed in {mode.value} mode with exit code {return_code}",
@@ -543,6 +578,9 @@ class CodexDockerAgent:
 
     def _no_output_timeout_for_mode(self, mode: DispatchMode) -> int:
         return self.mode_no_output_timeout_seconds.get(mode.value, self.no_output_timeout_seconds)
+
+    def _timeout_for_mode(self, mode: DispatchMode) -> int:
+        return self.mode_timeout_seconds.get(mode.value, self.timeout_seconds)
 
     def cancel_running(self) -> bool:
         with self._process_lock:

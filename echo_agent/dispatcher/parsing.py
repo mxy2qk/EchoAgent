@@ -6,6 +6,14 @@ from typing import Literal
 from echo_agent.dispatcher.types import ReasonResult, WorkerObservation, WorkerResult
 
 
+class ReasonFormatError(ValueError):
+    """reason 输出中没有可用的 JSON 对象。
+
+    与上游/网络等基础设施故障区分开：这是**模型的输出格式问题**，
+    调用方应做格式纠错重试，而不是把它累计成致命失败直接终止运行。
+    """
+
+
 def parse_worker_result(output: str) -> WorkerResult:
     slices = extract_mode_json_outputs(output, "explore")
     if not slices:
@@ -68,6 +76,8 @@ def parse_reason_result(output: str) -> ReasonResult:
 def _parse_json_object(output: str, mode: Literal["explore", "reason"]) -> dict[str, object]:
     matches = _matching_json_objects(output, mode)
     if not matches:
+        if mode == "reason":
+            raise ReasonFormatError("reason output does not contain a JSON object")
         raise ValueError(f"{mode} output does not contain a JSON object")
     data = matches[-1]
     if not isinstance(data, dict):
@@ -194,7 +204,7 @@ def _parse_reason_intents(data: dict[str, object]) -> list[dict[str, object]]:
     for item in raw_items:
         if isinstance(item, str):
             description = item.strip()
-            if description:
+            if description and not is_template_reason_intent(description, ""):
                 intents.append({"description": description, "from": None, "to": None, "action_key": ""})
             continue
         if not isinstance(item, dict):
@@ -202,12 +212,15 @@ def _parse_reason_intents(data: dict[str, object]) -> list[dict[str, object]]:
         description = _optional_str(item.get("description"))
         if not description:
             raise ValueError("reason output next_intents object description is required")
+        action_key = _optional_reason_text(item.get("action_key"), "action_key")
+        if is_template_reason_intent(description, action_key):
+            continue
         intents.append(
             {
                 "description": description,
                 "from": _optional_int(item.get("from")),
                 "to": _optional_int(item.get("to")),
-                "action_key": _optional_reason_text(item.get("action_key"), "action_key"),
+                "action_key": action_key,
             }
         )
     return intents
@@ -280,6 +293,20 @@ def is_template_worker_payload(data: dict[str, object]) -> bool:
     if _optional_answer(data.get("answer")) is not None:
         return False
     return "answer" in data or "fact_description" in data or "outcome" in data
+
+
+# reason prompt（prompts.py 的 build_reason_prompt）里示例 JSON 的逐字内容。
+# salvage / 回显 会把示例混进 reason 输出，若不剔除就会被当成真实规划去执行。
+_REASON_TEMPLATE_INTENTS = {
+    ("check-upload", "分析是否存在文件上传漏洞"),
+    ("enum-backup", "枚举 Web 目录和敏感备份文件"),
+}
+
+
+def is_template_reason_intent(description: object, action_key: object) -> bool:
+    normalized_description = " ".join(str(description or "").split())
+    normalized_key = str(action_key or "").strip().casefold()
+    return (normalized_key, normalized_description) in _REASON_TEMPLATE_INTENTS
 
 
 def substantive_worker_output(output: str) -> str | None:
