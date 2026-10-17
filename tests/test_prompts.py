@@ -53,6 +53,16 @@ class ReasonContextBudgetTests(unittest.TestCase):
         # 最新的一条保持完整
         self.assertIn("fact-49-" + "x" * 300, prompt)
 
+    def test_reason_prompt_explains_source_line(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+
+        prompt = PromptBuilder().build_reason_prompt(project)
+
+        self.assertIn("source:", prompt)
+        self.assertIn("不要仅因为", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,8 @@ class WorkerObservation:
     answer: str | None = None
     fact_description: str | None = None
     outcome: str | None = None
+    # 答案在原始输出中出现的上下文片段，用于让 reason 核验答案来源。
+    answer_source: str | None = None
 
 
 @dataclass(slots=True)
@@ -30,6 +32,8 @@ class WorkerResult:
     detail: str | None = None
     outcome: str | None = None
     prior_results: list[WorkerObservation] = field(default_factory=list)
+    # 答案在原始输出中出现的上下文片段（落盘时写入 fact，供 reason 核验）。
+    answer_source: str | None = None
 
     @property
     def has_answer(self) -> bool:

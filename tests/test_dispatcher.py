@@ -1303,5 +1303,36 @@ class AnswerProvenanceTests(unittest.TestCase):
         self.assertIsNone(Dispatcher._answer_provenance(project, "  "))
 
 
+class AnswerSourceContextTests(unittest.TestCase):
+    def test_context_extracts_around_answer(self) -> None:
+        from echo_agent.dispatcher.agents import answer_source_context
+
+        raw = "progress line\nH3: /['CTF2{abc}']\ntrailing line"
+
+        context = answer_source_context(raw, "CTF2{abc}")
+
+        self.assertIsNotNone(context)
+        self.assertIn("CTF2{abc}", context or "")
+        self.assertIn("H3", context or "")
+
+    def test_context_returns_none_when_answer_absent(self) -> None:
+        from echo_agent.dispatcher.agents import answer_source_context
+
+        self.assertIsNone(answer_source_context("no flag here", "CTF2{abc}"))
+        self.assertIsNone(answer_source_context("", "CTF2{abc}"))
+        self.assertIsNone(answer_source_context("text", ""))
+
+    def test_fact_text_includes_source_line(self) -> None:
+        result = WorkerResult(
+            answer="CTF2{abc}",
+            answer_source="H3: /['CTF2{abc}']",
+        )
+
+        text = Dispatcher._worker_result_fact_text(result)
+
+        self.assertIn("agent reported possible final answer: CTF2{abc}", text or "")
+        self.assertIn("source: H3", text or "")
+
+
 if __name__ == "__main__":
     unittest.main()

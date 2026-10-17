@@ -82,6 +82,8 @@ class PromptBuilder:
                 "findings 里的证伪正文只用于判断，不能作为 from，也不能换一种说法重做。",
                 "允许同一个 evidence 产生多个 intent，但 action_key 不能重复。",
                 "只有 answer 已经出现在某条 evidence 中时，才返回 completed=true。",
+                "若某条 evidence 带 `source:` 行，说明该答案附有它在靶机原始响应中的上下文片段；应据此核验，"
+                "不要仅因为 `agent reported possible final answer` 的措辞就否定它。",
                 "如果没有新的可执行方向，返回 completed=false、next_intents=[]，并用 stop_reason 说明原因。不要为了凑数重复旧动作。",
                 "最终只输出一个 JSON 对象，不要输出 Markdown 或额外解释。",
                 "",

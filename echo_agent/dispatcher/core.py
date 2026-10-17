@@ -799,6 +799,8 @@ class Dispatcher:
         fact_text = _optional_fact_description(observation.fact_description)
         if not fact_text and observation.answer:
             fact_text = f"agent reported possible final answer: {observation.answer}"
+            if observation.answer_source:
+                fact_text = f"{fact_text}\nsource: {observation.answer_source}"
         if not fact_text:
             return
         if observation.outcome == "refuted":
@@ -999,7 +1001,11 @@ class Dispatcher:
         if fact_description:
             return fact_description
         if result.answer:
-            return f"agent reported possible final answer: {result.answer}"
+            text = f"agent reported possible final answer: {result.answer}"
+            if result.answer_source:
+                # 附带原始输出片段，让 reason 能核验答案确实来自靶机响应（BUG-014）。
+                text = f"{text}\nsource: {result.answer_source}"
+            return text
         return None
 
     @staticmethod

@@ -710,7 +710,15 @@ class CodexWorker:
             prompt = self.prompt_builder.build_explore_prompt(project, intent)
         prompt = f"{prompt}\n\n{self._isolation_note(intent.id)}"
         result = _invoke_agent(self.agent, project, prompt, mode, log, intent_id=intent.id)
-        return parse_worker_result(result.output)
+        parsed = parse_worker_result(result.output)
+        # 把答案在原始输出中的上下文一并带上：否则落盘后只剩「模型声称」，
+        # reason 无法核验，只能拒绝完成（BUG-014）。
+        if parsed.answer:
+            parsed.answer_source = answer_source_context(result.output, parsed.answer)
+        for prior in parsed.prior_results:
+            if prior.answer and not prior.answer_source:
+                prior.answer_source = answer_source_context(result.output, prior.answer)
+        return parsed
 
     @staticmethod
     def _isolation_note(intent_id: int) -> str:
@@ -739,6 +747,23 @@ class CodexReasoner:
         parsed.salvaged = bool(getattr(result, "salvaged", False))
         return parsed
 
+
+
+_ANSWER_SOURCE_CONTEXT_CHARS = 240
+
+
+def answer_source_context(raw_output: str, answer: str | None) -> str | None:
+    """从原始输出中截取答案出现位置前后的片段，作为答案来源证据。"""
+    text = (answer or "").strip()
+    if not text or not raw_output:
+        return None
+    index = raw_output.find(text)
+    if index < 0:
+        return None
+    start = max(0, index - _ANSWER_SOURCE_CONTEXT_CHARS)
+    end = min(len(raw_output), index + len(text) + _ANSWER_SOURCE_CONTEXT_CHARS)
+    snippet = " ".join(raw_output[start:end].split())
+    return snippet or None
 
 
 def _invoke_agent(
