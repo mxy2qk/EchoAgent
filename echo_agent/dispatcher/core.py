@@ -39,6 +39,7 @@ class Dispatcher:
     _PARTIAL_OUTPUT_PREFIX = "未完成执行的输出摘录："
     _PARTIAL_OUTPUT_MIN_CHARS = 40
     _PARTIAL_OUTPUT_LIMIT = 4000
+    _ANSWER_WRAPPER_PREFIX = "agent reported possible final answer:"
 
     def __init__(
         self,
@@ -83,6 +84,8 @@ class Dispatcher:
         self._retry_counts: dict[int, int] = {}
         self._reason_failures = 0
         self._reason_format_failures = 0
+        self._reason_salvage_failures = 0
+        self.max_reason_salvage_failures = max_retryable_attempts * 2
         self._no_progress_reasons = 0
         if agent is None:
             agent = CodexDockerAgent(
@@ -308,6 +311,8 @@ class Dispatcher:
                     return self._reason_format_failure(project, retry_exc, release_project=release_project)
                 self._reason_format_failures = 0
             except Exception as exc:
+                if self._is_timeout_failure(exc):
+                    return self._reason_timeout_failure(project, exc, release_project=release_project)
                 return self._reason_failure_result(project, exc, release_project=release_project)
         finally:
             self._model_slots.release()
@@ -330,12 +335,28 @@ class Dispatcher:
                     "reason completion deferred",
                 )
             if result.answer and self._answer_in_evidence(project, result.answer):
+                provenance = self._answer_provenance(project, result.answer)
+                if provenance == "self-report":
+                    # 答案只出现在「agent reported possible final answer」包装事实里，
+                    # 属模型自述，未经独立验证；不阻断完成，但必须留痕（BUG-002）。
+                    self._log(
+                        project.id,
+                        "completion relies on model self-report; answer was not found in an "
+                        "independently verified fact",
+                        "warning",
+                        {"answer": result.answer, "provenance": provenance},
+                    )
                 self._set_end_fact_result(project, result.answer)
                 self._connect_answer_fact_to_goal(project, result.answer)
                 self._complete_project(project)
                 self._no_progress_reasons = 0
                 self._persist_step(project, release_project=release_project)
-                self._log(project.id, "reason marked project completed", "success", {"has_answer": True})
+                self._log(
+                    project.id,
+                    "reason marked project completed",
+                    "success",
+                    {"has_answer": True, "provenance": provenance},
+                )
                 return DispatchResult(project.id, DispatchMode.COMPLETED, project.status, "reason marked project completed")
             self._log(
                 project.id,
@@ -379,10 +400,36 @@ class Dispatcher:
                 action_key=action_key,
             )
             planned_count += 1
+        if planned_count == 0 and result.salvaged:
+            # 超时/中断后的 salvage 空规划，不代表模型没有方向（BUG-013）：
+            # 不计入 no-progress，改用独立的、更宽松的计数。
+            self._reason_salvage_failures += 1
+            self._persist_step(project, release_project=release_project)
+            self._log(
+                project.id,
+                f"reason produced no plan after salvage "
+                f"({self._reason_salvage_failures}/{self.max_reason_salvage_failures}); will retry",
+                "warning",
+            )
+            if self._reason_salvage_failures >= self.max_reason_salvage_failures:
+                self._log(project.id, "reason kept timing out; dispatcher will stop", "error")
+                return DispatchResult(
+                    project.id,
+                    DispatchMode.SKIPPED,
+                    project.status,
+                    "reason timed out repeatedly without producing a plan",
+                )
+            return DispatchResult(
+                project.id,
+                DispatchMode.REASON,
+                project.status,
+                "reason salvaged after timeout; will retry",
+            )
         if planned_count == 0:
             self._no_progress_reasons += 1
         else:
             self._no_progress_reasons = 0
+            self._reason_salvage_failures = 0
         self._persist_step(project, release_project=release_project)
         self._log(
             project.id,
@@ -526,18 +573,33 @@ class Dispatcher:
         return fact.kind in {FactKind.GOAL, FactKind.EVIDENCE}
 
     @staticmethod
-    def _answer_in_evidence(project: Project, answer: str) -> bool:
+    def _answer_provenance(project: Project, answer: str) -> str | None:
+        """返回答案来源：evidence（真实事实）/ self-report（仅模型自述包装）/ None。
+
+        超时/中断留下的输出摘录不是结论，即使里面出现答案字符串也不采信（BUG-002/005）。
+        若答案只出现在 `agent reported possible final answer:` 包装事实里，说明它来自
+        模型自述而非已落盘的验证事实，调用方应留痕但不据此拒绝完成。
+        """
         text = answer.strip()
         if not text:
-            return False
-        # 只认可**已验证事实**里的答案；超时/中断留下的输出摘录不是结论，
-        # 即使里面碰巧出现答案字符串，也不能据此判定项目完成（BUG-002/005）。
-        return any(
-            fact.kind == FactKind.EVIDENCE
-            and not fact.description.startswith(Dispatcher._PARTIAL_OUTPUT_PREFIX)
-            and text in fact.description
-            for fact in project.facts.values()
-        )
+            return None
+        self_report = False
+        for fact in sorted(project.facts.values(), key=lambda item: item.id):
+            if fact.kind != FactKind.EVIDENCE:
+                continue
+            if text not in fact.description:
+                continue
+            if fact.description.startswith(Dispatcher._PARTIAL_OUTPUT_PREFIX):
+                continue
+            if fact.description.startswith(Dispatcher._ANSWER_WRAPPER_PREFIX):
+                self_report = True
+                continue
+            return "evidence"
+        return "self-report" if self_report else None
+
+    @classmethod
+    def _answer_in_evidence(cls, project: Project, answer: str) -> bool:
+        return cls._answer_provenance(project, answer) is not None
 
     @staticmethod
     def _valid_fact_id(project: Project, value: object) -> int | None:
@@ -835,6 +897,42 @@ class Dispatcher:
             DispatchMode.REASON,
             project.status,
             "reason output was not JSON; will retry",
+        )
+
+    @staticmethod
+    def _is_timeout_failure(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return "timed out" in text or "without stdout/stderr" in text
+
+    def _reason_timeout_failure(
+        self,
+        project: Project,
+        exc: Exception,
+        release_project: bool,
+    ) -> DispatchResult:
+        """reason 调用超时（墙钟或无输出），不代表模型没有方向（BUG-013）。"""
+        self._reason_salvage_failures += 1
+        self._persist_step(project, release_project=release_project)
+        self._log(
+            project.id,
+            f"reason timed out "
+            f"({self._reason_salvage_failures}/{self.max_reason_salvage_failures}); will retry",
+            "warning",
+            {"error": str(exc)},
+        )
+        if self._reason_salvage_failures >= self.max_reason_salvage_failures:
+            self._log(project.id, "reason kept timing out; dispatcher will stop", "error")
+            return DispatchResult(
+                project.id,
+                DispatchMode.SKIPPED,
+                project.status,
+                "reason timed out repeatedly without producing a plan",
+            )
+        return DispatchResult(
+            project.id,
+            DispatchMode.REASON,
+            project.status,
+            "reason timed out; will retry",
         )
 
     def _reason_failure_result(

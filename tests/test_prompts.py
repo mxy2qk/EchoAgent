@@ -1,0 +1,58 @@
+from __future__ import annotations
+
+import unittest
+
+from echo_agent.dispatcher.prompts import PromptBuilder
+from echo_agent.models import Project, ProjectStatus
+
+
+class FirstRunPromptTests(unittest.TestCase):
+    @staticmethod
+    def _project_with_intent() -> tuple[Project, object]:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        intent = project.add_intent("初始探测", from_fact_id=0, to_fact_id=1)
+        return project, intent
+
+    def test_first_run_prompt_allows_incremental_json(self) -> None:
+        project, intent = self._project_with_intent()
+
+        prompt = PromptBuilder().build_first_run_prompt(project, intent)  # type: ignore[arg-type]
+
+        # 允许中途多次输出 JSON：超时被中断时，已确认的事实仍能被 salvage 成 fact。
+        self.assertIn("允许在同一次执行中输出多个 JSON", prompt)
+        self.assertIn("已确认的事实也不会丢失", prompt)
+        self.assertIn('"fact_description"', prompt)
+
+    def test_explore_prompt_still_single_result(self) -> None:
+        project, intent = self._project_with_intent()
+
+        prompt = PromptBuilder().build_explore_prompt(project, intent)  # type: ignore[arg-type]
+
+        self.assertIn("只执行给定 intent", prompt)
+        self.assertIn('"fact_description"', prompt)
+
+
+class ReasonContextBudgetTests(unittest.TestCase):
+    def test_older_evidence_is_truncated_but_ids_are_kept(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        total = 50
+        for index in range(total):
+            project.add_fact(f"fact-{index}-" + "x" * 300, fact_id=2 + index)
+
+        prompt = PromptBuilder().build_reason_prompt(project)
+
+        # 所有 evidence id 仍出现在 allowed_from 里
+        for index in range(total):
+            self.assertIn(str(2 + index), prompt)
+        # 较早的事实被截断
+        self.assertIn("较早事实已截断", prompt)
+        # 最新的一条保持完整
+        self.assertIn("fact-49-" + "x" * 300, prompt)
+
+
+if __name__ == "__main__":
+    unittest.main()

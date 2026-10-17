@@ -1220,5 +1220,88 @@ class StopDuringExecutionWorker:
         return WorkerResult(fact_description="发现隐藏接口 /internal/fetch")
 
 
+class SalvagedEmptyReasoner:
+    """模拟：reason 因超时被 salvage，只得到空规划。"""
+
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(completed=False, next_intents=[], salvaged=True)
+
+
+class ReasonSalvageProgressTests(unittest.TestCase):
+    @staticmethod
+    def _project_ready_for_reason() -> Project:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("web service exposes upload form", fact_id=2)
+        seed = project.add_intent("initial discovery", from_fact_id=0, to_fact_id=2)
+        seed.mark_running()
+        seed.mark_completed()
+        return project
+
+    def _dispatcher(self, project: Project) -> tuple[Dispatcher, MemoryProjectClient]:
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=SalvagedEmptyReasoner(),  # type: ignore[arg-type]
+        )
+        return dispatcher, client
+
+    def test_salvaged_empty_plan_does_not_count_as_no_progress(self) -> None:
+        dispatcher, _ = self._dispatcher(self._project_ready_for_reason())
+
+        result = dispatcher.run_once(1)
+
+        self.assertEqual(result.mode, DispatchMode.REASON)
+        self.assertIn("salvaged after timeout", result.message)
+        self.assertEqual(dispatcher._no_progress_reasons, 0)
+        self.assertEqual(dispatcher._reason_salvage_failures, 1)
+
+    def test_repeated_salvage_stops_with_explicit_reason(self) -> None:
+        dispatcher, _ = self._dispatcher(self._project_ready_for_reason())
+
+        result = None
+        for _ in range(dispatcher.max_reason_salvage_failures):
+            result = dispatcher.run_once(1)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.mode, DispatchMode.SKIPPED)
+        self.assertIn("timed out repeatedly", result.message)
+
+
+class AnswerProvenanceTests(unittest.TestCase):
+    @staticmethod
+    def _project_with_fact(description: str, kind: str = "evidence") -> Project:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact(description, fact_id=2, kind=kind)
+        return project
+
+    def test_answer_from_real_evidence_is_provenance_evidence(self) -> None:
+        project = self._project_with_fact("靶机 /flag 返回 CTF2{abc}")
+
+        self.assertEqual(Dispatcher._answer_provenance(project, "CTF2{abc}"), "evidence")
+        self.assertTrue(Dispatcher._answer_in_evidence(project, "CTF2{abc}"))
+
+    def test_answer_only_in_wrapper_is_self_report(self) -> None:
+        project = self._project_with_fact("agent reported possible final answer: CTF2{abc}")
+
+        self.assertEqual(Dispatcher._answer_provenance(project, "CTF2{abc}"), "self-report")
+        self.assertTrue(Dispatcher._answer_in_evidence(project, "CTF2{abc}"))
+
+    def test_answer_only_in_salvage_excerpt_is_not_accepted(self) -> None:
+        project = self._project_with_fact("未完成执行的输出摘录：\nCTF2{abc}")
+
+        self.assertIsNone(Dispatcher._answer_provenance(project, "CTF2{abc}"))
+        self.assertFalse(Dispatcher._answer_in_evidence(project, "CTF2{abc}"))
+
+    def test_empty_answer_has_no_provenance(self) -> None:
+        project = self._project_with_fact("CTF2{abc}")
+
+        self.assertIsNone(Dispatcher._answer_provenance(project, "  "))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -99,6 +99,8 @@ class CodexDockerAgent:
         self._preflight_ready: set[str] = set()
         self._process_lock = threading.Lock()
         self._processes: list[subprocess.Popen[str]] = []
+        # 最近一次 _consume_process 是否走了 salvage 路径（超时/非零退出）。
+        self._last_salvaged = False
 
     def run(
         self,
@@ -136,7 +138,7 @@ class CodexDockerAgent:
         )
         output = self._run_process(command, prompt, mode, env=env, log=log)
         self._log(log, f"codex agent process finished in {mode.value} mode", metadata={"output_chars": len(output)})
-        return AgentRunResult(output=output)
+        return AgentRunResult(output=output, salvaged=self._last_salvaged)
 
     def intent_runtime_paths(self, intent_id: int) -> tuple[str, str]:
         return self.runtime_paths(f"intents/{intent_id}")
@@ -317,6 +319,7 @@ class CodexDockerAgent:
         mode: DispatchMode,
         log: AgentLogCallback | None,
     ) -> str:
+        self._last_salvaged = False
         assert process.stdin is not None
         assert process.stdout is not None
         assert process.stderr is not None
@@ -422,6 +425,7 @@ class CodexDockerAgent:
                         "warning",
                         {"timeout_seconds": timeout_seconds, "output_lines": output_count},
                     )
+                    self._last_salvaged = True
                     return salvaged
                 self._log(
                     log,
@@ -459,6 +463,7 @@ class CodexDockerAgent:
                             "output_lines": output_count,
                         },
                     )
+                    self._last_salvaged = True
                     return salvaged
                 self._log(
                     log,
@@ -531,6 +536,7 @@ class CodexDockerAgent:
                     "warning",
                     {"recent_output": detail},
                 )
+                self._last_salvaged = True
                 return salvaged_output
             if any(marker in combined.lower() for marker in TRANSIENT_UPSTREAM_MARKERS):
                 # 上游过载 / 流中断：属瞬时故障，交给调度层的重试预算处理，
@@ -728,7 +734,10 @@ class CodexReasoner:
             "不要杀死其他进程，不要修改其他 intent 目录。"
         )
         result = _invoke_agent(self.agent, project, prompt, DispatchMode.REASON, log, runtime_key="reason")
-        return parse_reason_result(result.output)
+        parsed = parse_reason_result(result.output)
+        # 标记该结果是否来自超时/中断后的 salvage：空规划在此情况下不代表「没有方向」。
+        parsed.salvaged = bool(getattr(result, "salvaged", False))
+        return parsed
 
 
 

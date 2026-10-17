@@ -44,6 +44,9 @@ class ReasonResult:
     answer: str | None = None
     stop_reason: str = ""
     raw_output: str = ""
+    # 该结果来自超时/中断后的 salvage，而不是模型正常收尾。
+    # 空规划在这种情况不代表「没有方向」，不应计入 no-progress。
+    salvaged: bool = False
 
 
 @dataclass(slots=True)
@@ -69,6 +72,8 @@ class IntentExecutionResult:
 @dataclass(slots=True)
 class AgentRunResult:
     output: str
+    # True 表示 output 是从超时/非零退出的原始流里 salvage 出来的，而非正常收尾。
+    salvaged: bool = False
 
 
 AgentLogCallback = Callable[[str, str, dict[str, object] | None], None]

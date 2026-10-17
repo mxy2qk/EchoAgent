@@ -53,7 +53,7 @@ timeout_seconds = 1800
 no_output_timeout_seconds = 900
 first_run_no_output_timeout_seconds = 900
 explore_no_output_timeout_seconds = 180
-reason_no_output_timeout_seconds = 300
+reason_no_output_timeout_seconds = 900
 
 # Prefer OPENAI_API_KEY / ECHO_AGENT_OPENAI_API_KEY instead of storing a key here.
 api_key = ""

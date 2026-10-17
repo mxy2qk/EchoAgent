@@ -4,6 +4,10 @@ import json
 
 from echo_agent.models import FactKind, Intent, IntentOutcome, IntentStatus, Project
 
+# reason prompt 的上下文预算：最近 N 条 evidence 全量，更早的只保留摘要。
+_EVIDENCE_PROMPT_LIMIT = 40
+_EVIDENCE_OLDER_CHARS = 160
+
 
 class PromptBuilder:
     def build_first_run_prompt(self, project: Project, intent: Intent) -> str:
@@ -14,10 +18,12 @@ class PromptBuilder:
                 "如果能够得到 flag，返回 answer；如果不能得到 flag，只总结一个对后续探索最有价值的新事实 fact_description。",
                 "不要规划后续 intent。后续 intent 由 reason 模式在下一轮循环中规划。",
                 "你运行在该项目对应的 Kali Docker 容器中，可以使用容器内工具完成快速验证、扫描、利用和取证。",
+                "每确认一个关键事实，就立即输出一个 JSON 对象记录它；允许在同一次执行中输出多个 JSON。",
+                "执行结束时再输出最后一个 JSON 作为总结。这样即使本次执行被超时中断，已确认的事实也不会丢失。",
                 "不要长时间等待无输出命令；如果某个命令持续运行或输出为空，应立即停止等待并把当前可确认的信息总结为 fact_description。",
                 "如果已经得到 HTTP 状态、源码片段、目录枚举结果或命令超时信息，应立即输出 JSON 总结事实，不要继续扩大字典或扩展名猜测。",
                 "除非已经明确拿到 flag，否则不要因为单个命令卡住而继续等待。",
-                "最终只输出一个 JSON 对象，不要输出 Markdown 或额外解释。",
+                "输出内容只能是 JSON 对象，不要输出 Markdown 或额外解释；允许在执行过程中多次输出。",
                 "",
                 "JSON 格式：",
                 '{"answer": "实际获得的完整 flag；不要照抄本句", "fact_description": null, "outcome": "verified"}',
@@ -90,11 +96,19 @@ class PromptBuilder:
 
 
 def _format_project_context(project: Project) -> str:
-    evidence = [
-        {"id": fact.id, "description": fact.description}
+    evidence_facts = [
+        fact
         for fact in sorted(project.facts.values(), key=lambda item: item.id)
         if fact.kind == FactKind.EVIDENCE
     ]
+    # 上下文预算：较早的 evidence 只保留摘要，避免 prompt 随运行无限膨胀。
+    keep_from = max(0, len(evidence_facts) - _EVIDENCE_PROMPT_LIMIT)
+    evidence = []
+    for index, fact in enumerate(evidence_facts):
+        description = fact.description
+        if index < keep_from and len(description) > _EVIDENCE_OLDER_CHARS:
+            description = description[:_EVIDENCE_OLDER_CHARS] + "…（较早事实已截断）"
+        evidence.append({"id": fact.id, "description": description})
     executed = [
         intent
         for intent in sorted(project.intents.values(), key=lambda item: item.id)
