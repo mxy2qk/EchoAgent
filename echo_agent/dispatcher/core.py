@@ -358,6 +358,7 @@ class Dispatcher:
             self._model_slots.release()
         self._reason_failures = 0
         self._reason_format_failures = 0
+        completion_rejected = False
         if result.completed:
             if any(intent.status == IntentStatus.RUNNING for intent in project.intents.values()):
                 recovered = self._recover_stranded_intents(project)
@@ -388,8 +389,23 @@ class Dispatcher:
                 "warning",
                 {"has_answer": bool(result.answer)},
             )
+            completion_rejected = True
 
         planned_intents = self._planned_intents_from_reason_result(project, result)
+        if completion_rejected and not planned_intents and result.answer:
+            # 模型声称完成但缺少证据、又没规划下一步：自动生成一条针对性验证，
+            # 避免运行停在原地（BUG-016）。
+            planned_intents = [
+                {
+                    "description": (
+                        f"重新取证并确认候选答案 {result.answer}：从目标响应中重新获取该字符串，"
+                        "确认它确实来自靶机而非模型推测。"
+                    ),
+                    "from": None,
+                    "to": None,
+                    "action_key": "verify-candidate-answer",
+                }
+            ]
         planned_count = 0
         skipped_repeat = 0
         skipped_from = 0
@@ -596,6 +612,7 @@ class Dispatcher:
         return fact.kind in {FactKind.GOAL, FactKind.EVIDENCE}
 
     _ANSWER_WRAPPER_PREFIX = "agent reported possible final answer:"
+    _ANSWER_SOURCE_CONTEXT_CHARS = 240
 
     @staticmethod
     def _answer_source_line(description: str) -> str:
@@ -603,6 +620,34 @@ class Dispatcher:
             if line.startswith("source:"):
                 return line.split(":", 1)[1].strip()
         return ""
+
+    @classmethod
+    def _backfill_answer_source(cls, project: Project, result: WorkerResult) -> None:
+        """worker 自身输出里找不到答案时，从项目已有事实回填来源（BUG-016）。
+
+        并行 explore 中，一个 intent 常转述另一个 intent 刚发现的答案；它自己的
+        原始输出里没有该字符串，导致 `source:` 缺失、完成判定被永久阻塞。
+        """
+        if result.answer_source or not result.answer:
+            return
+        text = result.answer.strip()
+        if not text:
+            return
+        for fact in sorted(project.facts.values(), key=lambda item: item.id):
+            description = fact.description
+            if text not in description:
+                continue
+            if description.startswith(cls._PARTIAL_OUTPUT_PREFIX):
+                continue
+            if description.startswith(cls._ANSWER_WRAPPER_PREFIX):
+                continue
+            index = description.find(text)
+            start = max(0, index - cls._ANSWER_SOURCE_CONTEXT_CHARS)
+            end = min(len(description), index + len(text) + cls._ANSWER_SOURCE_CONTEXT_CHARS)
+            snippet = " ".join(description[start:end].split())
+            if snippet:
+                result.answer_source = snippet
+                return
 
     @classmethod
     def _fact_supports_answer(cls, fact: object, answer: str) -> bool:
@@ -792,6 +837,7 @@ class Dispatcher:
     def _apply_intent_result(project: Project, item: IntentExecutionResult) -> None:
         result = item.result
         intent = item.intent
+        Dispatcher._backfill_answer_source(project, result)
         if result.retryable:
             if intent.status == IntentStatus.RUNNING:
                 intent.release()

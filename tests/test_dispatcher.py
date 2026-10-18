@@ -1787,5 +1787,67 @@ class FormatAndExcerptTests(unittest.TestCase):
         self.assertTrue(Dispatcher._is_retryable_failure(RuntimeError("provider overloaded, reconnecting")))
 
 
+class BadCompletionReasoner:
+    """声称完成，但答案不在 evidence 中，且不规划下一步。"""
+
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(completed=True, answer="DASCTF{not-in-evidence}", next_intents=[])
+
+
+class AnswerSourceBackfillTests(unittest.TestCase):
+    @staticmethod
+    def _project_with_evidence(description: str) -> Project:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact(description, fact_id=2)
+        return project
+
+    def test_backfill_uses_existing_evidence_fact(self) -> None:
+        project = self._project_with_evidence(
+            'UNION 回显 array(1) { [0]=> string(40) "DASCTF{abc}" }'
+        )
+        result = WorkerResult(answer="DASCTF{abc}")
+
+        Dispatcher._backfill_answer_source(project, result)
+
+        self.assertIsNotNone(result.answer_source)
+        self.assertIn("DASCTF{abc}", result.answer_source or "")
+
+    def test_backfill_ignores_wrapper_fact(self) -> None:
+        project = self._project_with_evidence("agent reported possible final answer: DASCTF{abc}")
+        result = WorkerResult(answer="DASCTF{abc}")
+
+        Dispatcher._backfill_answer_source(project, result)
+
+        self.assertIsNone(result.answer_source)
+
+    def test_backfill_keeps_existing_source(self) -> None:
+        project = self._project_with_evidence('var_dump "DASCTF{abc}"')
+        result = WorkerResult(answer="DASCTF{abc}", answer_source="already-set")
+
+        Dispatcher._backfill_answer_source(project, result)
+
+        self.assertEqual(result.answer_source, "already-set")
+
+    def test_rejected_completion_plans_verification_intent(self) -> None:
+        project = self._project_with_evidence("some unrelated evidence")
+        seed = project.add_intent("initial discovery", from_fact_id=0, to_fact_id=2)
+        seed.mark_running()
+        seed.mark_completed()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=BadCompletionReasoner(),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id)
+
+        self.assertEqual(result.mode, DispatchMode.REASON)
+        keys = [intent.action_key for intent in client.project.intents.values()]
+        self.assertIn("verify-candidate-answer", keys)
+
+
 if __name__ == "__main__":
     unittest.main()
