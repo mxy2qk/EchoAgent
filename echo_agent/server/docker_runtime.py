@@ -107,6 +107,10 @@ class DockerProjectRuntime:
                     "-d",
                     "--name",
                     container,
+                    "--add-host",
+                    "host.docker.internal:127.0.0.1",
+                    "--add-host",
+                    "gateway.docker.internal:127.0.0.1",
         ]
         for host_path, container_path, read_only in mounts:
             mode = "ro" if read_only else "rw"

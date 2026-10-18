@@ -20,6 +20,7 @@ class WorkerObservation:
     answer: str | None = None
     fact_description: str | None = None
     outcome: str | None = None
+    answer_source: str | None = None
 
 
 @dataclass(slots=True)
@@ -30,6 +31,8 @@ class WorkerResult:
     detail: str | None = None
     outcome: str | None = None
     prior_results: list[WorkerObservation] = field(default_factory=list)
+    answer_source: str | None = None
+    timed_out: bool = False
 
     @property
     def has_answer(self) -> bool:
@@ -44,6 +47,7 @@ class ReasonResult:
     answer: str | None = None
     stop_reason: str = ""
     raw_output: str = ""
+    salvaged: bool = False
 
 
 @dataclass(slots=True)
@@ -69,6 +73,9 @@ class IntentExecutionResult:
 @dataclass(slots=True)
 class AgentRunResult:
     output: str
+    salvaged: bool = False
+    timed_out: bool = False
+    raw_output: str = ""
 
 
 AgentLogCallback = Callable[[str, str, dict[str, object] | None], None]

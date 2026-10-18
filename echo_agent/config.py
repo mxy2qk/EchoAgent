@@ -30,6 +30,7 @@ class ServerSettings:
     host: str
     port: int
     database_path: Path
+    auth_token: str | None = None
 
     @classmethod
     def from_env(cls) -> "ServerSettings":
@@ -41,12 +42,16 @@ class ServerSettings:
                 config,
                 _setting("ECHO_AGENT_DB", config, "server", "database_path")
             ),
+            auth_token=_optional_config_setting(
+                "ECHO_AGENT_SERVER_AUTH_TOKEN", config, "server", "auth_token"
+            ),
         )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class DispatcherSettings:
     server_url: str
+    server_auth_token: str | None = None
     interval_seconds: float
     explore_max_workers: int
     codex_max_slots: int = 2
@@ -84,6 +89,9 @@ class DispatcherSettings:
         return cls(
             server_url=_setting(
                 "ECHO_AGENT_SERVER_URL", config, "dispatcher", "server_url"
+            ),
+            server_auth_token=_optional_config_setting(
+                "ECHO_AGENT_SERVER_AUTH_TOKEN", config, "server", "auth_token"
             ),
             interval_seconds=float(
                 _setting(

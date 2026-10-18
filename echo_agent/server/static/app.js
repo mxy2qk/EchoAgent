@@ -38,11 +38,24 @@ const els = {
   logs: document.querySelector("#log-list"),
 };
 
-async function api(path, options = {}) {
-  const response = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
+function authToken() {
+  return localStorage.getItem("echoAgentToken") || "";
+}
+
+async function api(path, options = {}, retried = false) {
+  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  const token = authToken();
+  if (token) {
+    headers["X-Echo-Agent-Token"] = token;
+  }
+  const response = await fetch(path, { ...options, headers });
+  if (response.status === 401 && !retried) {
+    const entered = window.prompt("需要访问令牌（X-Echo-Agent-Token）：");
+    if (entered && entered.trim()) {
+      localStorage.setItem("echoAgentToken", entered.trim());
+      return api(path, options, true);
+    }
+  }
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     throw new Error(body.detail || body.error || `${response.status} ${response.statusText}`);

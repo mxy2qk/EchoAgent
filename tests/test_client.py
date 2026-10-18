@@ -81,6 +81,18 @@ class ProjectClientRetryTests(unittest.TestCase):
         self.assertEqual(calls["count"], 1)
         self.assertEqual(sleep.call_count, 0)
 
+    def test_auth_token_header_is_sent_without_changing_retry_policy(self) -> None:
+        client = ProjectClient("http://127.0.0.1:9", auth_token="secret")
+        seen: dict[str, str] = {}
+
+        def fake_urlopen(request, timeout=10):  # type: ignore[no-untyped-def]
+            seen["token"] = request.get_header("X-echo-agent-token")
+            return _Response(b'{"ok": true}')
+
+        with patch("echo_agent.dispatcher.client.urlopen", fake_urlopen):
+            self.assertEqual(client._request("POST", "/projects/1", {"name": "x"}), {"ok": True})
+        self.assertEqual(seen["token"], "secret")
+
     def test_non_transient_urlerror_is_not_retried(self) -> None:
         client = ProjectClient("http://127.0.0.1:9")
         calls = {"count": 0}

@@ -168,3 +168,32 @@ items = [
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AuthTokenConfigTests(unittest.TestCase):
+    def test_auth_token_is_optional_and_shared_with_dispatcher(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "echo_agent.toml"
+            config_path.write_text('[server]\nauth_token = "abc"\n', encoding="utf-8")
+            with patch.dict(os.environ, {"ECHO_AGENT_CONFIG": str(config_path)}, clear=True):
+                server = ServerSettings.from_env()
+                dispatcher = DispatcherSettings.from_env()
+        self.assertEqual(server.auth_token, "abc")
+        self.assertEqual(dispatcher.server_auth_token, "abc")
+
+    def test_blank_auth_token_stays_unset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "echo_agent.toml"
+            config_path.write_text('[server]\nauth_token = ""\n', encoding="utf-8")
+            with patch.dict(os.environ, {"ECHO_AGENT_CONFIG": str(config_path)}, clear=True):
+                server = ServerSettings.from_env()
+        self.assertIsNone(server.auth_token)
+
+    def test_example_reason_idle_timeout_is_long_enough_to_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "echo_agent.toml"
+            config_path.write_text("[codex]\n", encoding="utf-8")
+            with patch.dict(os.environ, {"ECHO_AGENT_CONFIG": str(config_path)}, clear=True):
+                settings = DispatcherSettings.from_env()
+        self.assertEqual(settings.codex_reason_no_output_timeout_seconds, 900)
+

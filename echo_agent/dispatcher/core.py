@@ -12,7 +12,11 @@ from echo_agent.dispatcher.parsing import (
     ReasonFormatError,
     _optional_fact_description,
     is_template_reason_intent,
+    parse_reason_result,
+    parse_worker_result,
+    repair_reason_output,
     strip_prompt_template_text,
+    strip_result_json_text,
 )
 from echo_agent.dispatcher.prompts import PromptBuilder
 from echo_agent.dispatcher.types import (
@@ -47,6 +51,8 @@ def step_consumes_budget(result: DispatchResult) -> bool:
         "reason failed; will retry",
         "reason output was not JSON; will retry",
         "reason skipped",
+        "reason timed out; will retry",
+        "reason salvaged after timeout; will retry",
     }:
         return False
     return True
@@ -106,6 +112,8 @@ class Dispatcher:
         self._retry_counts: dict[int, int] = {}
         self._reason_failures = 0
         self._reason_format_failures = 0
+        self._reason_salvage_failures = 0
+        self.max_reason_salvage_failures = max_retryable_attempts * 2
         self._no_progress_reasons = 0
         self._target_offline_streak = 0
         if agent is None:
@@ -319,21 +327,32 @@ class Dispatcher:
             try:
                 result = self._call_reasoner(project)
             except ReasonFormatError as exc:
-                self._log(
-                    project.id,
-                    f"reason output was not a JSON object; retrying once: {exc}",
-                    "warning",
-                    {"error": str(exc)},
-                )
-                try:
-                    result = self._call_reasoner(project)
-                except ReasonFormatError as retry_exc:
-                    return self._reason_format_failure(
-                        project,
-                        retry_exc,
-                        release_project=release_project,
+                repaired = self._reason_result_from_repair(exc)
+                if repaired is not None:
+                    self._log(project.id, "reason prose repaired into JSON", "warning")
+                    result = repaired
+                else:
+                    self._log(
+                        project.id,
+                        f"reason output was not a JSON object; retrying once: {exc}",
+                        "warning",
+                        {"error": str(exc)},
                     )
+                    try:
+                        result = self._call_reasoner(project)
+                    except ReasonFormatError as retry_exc:
+                        repaired = self._reason_result_from_repair(retry_exc)
+                        if repaired is None:
+                            return self._reason_format_failure(
+                                project,
+                                retry_exc,
+                                release_project=release_project,
+                            )
+                        self._log(project.id, "reason prose repaired into JSON", "warning")
+                        result = repaired
             except Exception as exc:
+                if self._is_timeout_failure(exc):
+                    return self._reason_timeout_failure(project, exc, release_project=release_project)
                 return self._reason_failure_result(project, exc, release_project=release_project)
         finally:
             self._model_slots.release()
@@ -355,7 +374,7 @@ class Dispatcher:
                     project.status,
                     "reason completion deferred",
                 )
-            if result.answer and self._answer_in_evidence(project, result.answer):
+            if result.answer and self._answer_provenance(project, result.answer) == "verified":
                 self._set_end_fact_result(project, result.answer)
                 self._connect_answer_fact_to_goal(project, result.answer)
                 self._complete_project(project)
@@ -405,10 +424,34 @@ class Dispatcher:
                 action_key=action_key,
             )
             planned_count += 1
+        if planned_count == 0 and result.salvaged:
+            self._reason_salvage_failures += 1
+            self._persist_step(project, release_project=release_project)
+            self._log(
+                project.id,
+                f"reason produced no plan after timeout salvage "
+                f"({self._reason_salvage_failures}/{self.max_reason_salvage_failures}); will retry",
+                "warning",
+            )
+            if self._reason_salvage_failures >= self.max_reason_salvage_failures:
+                self._log(project.id, "reason kept timing out; dispatcher will stop", "error")
+                return DispatchResult(
+                    project.id,
+                    DispatchMode.SKIPPED,
+                    project.status,
+                    "reason timed out repeatedly without producing a plan",
+                )
+            return DispatchResult(
+                project.id,
+                DispatchMode.REASON,
+                project.status,
+                "reason salvaged after timeout; will retry",
+            )
         if planned_count == 0:
             self._no_progress_reasons += 1
         else:
             self._no_progress_reasons = 0
+            self._reason_salvage_failures = 0
         self._persist_step(project, release_project=release_project)
         self._log(
             project.id,
@@ -538,6 +581,7 @@ class Dispatcher:
         if not detail or cls._OUTPUT_TAIL_MARKER not in detail:
             return
         tail = strip_prompt_template_text(detail.split(cls._OUTPUT_TAIL_MARKER, 1)[1]).strip()
+        tail = strip_result_json_text(tail).strip()
         if len(tail) < cls._PARTIAL_OUTPUT_MIN_CHARS:
             return
         if len(tail) > cls._PARTIAL_OUTPUT_LIMIT:
@@ -551,17 +595,41 @@ class Dispatcher:
             return False
         return fact.kind in {FactKind.GOAL, FactKind.EVIDENCE}
 
+    _ANSWER_WRAPPER_PREFIX = "agent reported possible final answer:"
+
     @staticmethod
-    def _answer_in_evidence(project: Project, answer: str) -> bool:
+    def _answer_source_line(description: str) -> str:
+        for line in description.splitlines():
+            if line.startswith("source:"):
+                return line.split(":", 1)[1].strip()
+        return ""
+
+    @classmethod
+    def _fact_supports_answer(cls, fact: object, answer: str) -> bool:
+        kind = getattr(fact, "kind", None)
+        description = str(getattr(fact, "description", ""))
+        if kind != FactKind.EVIDENCE or answer not in description:
+            return False
+        if description.startswith(cls._PARTIAL_OUTPUT_PREFIX):
+            return False
+        if description.startswith(cls._ANSWER_WRAPPER_PREFIX):
+            source = cls._answer_source_line(description)
+            return bool(source and answer in source)
+        return True
+
+    @classmethod
+    def _answer_provenance(cls, project: Project, answer: str) -> str | None:
         text = answer.strip()
         if not text:
-            return False
-        return any(
-            fact.kind == FactKind.EVIDENCE
-            and not fact.description.startswith(Dispatcher._PARTIAL_OUTPUT_PREFIX)
-            and text in fact.description
-            for fact in project.facts.values()
-        )
+            return None
+        for fact in project.facts.values():
+            if cls._fact_supports_answer(fact, text):
+                return "verified"
+        return None
+
+    @classmethod
+    def _answer_in_evidence(cls, project: Project, answer: str) -> bool:
+        return cls._answer_provenance(project, answer) == "verified"
 
     @staticmethod
     def _valid_fact_id(project: Project, value: object) -> int | None:
@@ -728,9 +796,18 @@ class Dispatcher:
             if intent.status == IntentStatus.RUNNING:
                 intent.release()
             return
+        if result.timed_out:
+            Dispatcher._store_worker_observations(project, result)
+            if intent.status == IntentStatus.RUNNING:
+                intent.mark_failed(
+                    IntentOutcome.ERROR,
+                    note="execution timed out after partial facts were saved; intent left incomplete",
+                )
+            return
         for prior in result.prior_results:
             Dispatcher._add_prior_fact(project, prior)
         if result.outcome == "error":
+            Dispatcher._persist_json_facts_from_detail(project, result.detail)
             Dispatcher._record_partial_output(project, result.detail)
             if intent.status == IntentStatus.RUNNING:
                 intent.mark_failed(IntentOutcome.ERROR, note=result.detail or "execution failed")
@@ -754,12 +831,52 @@ class Dispatcher:
 
 
     @staticmethod
+    def _store_worker_observations(project: Project, result: WorkerResult) -> int:
+        observations = list(result.prior_results)
+        if result.fact_description or result.answer:
+            observations.append(
+                WorkerObservation(
+                    answer=result.answer,
+                    fact_description=result.fact_description,
+                    outcome=result.outcome,
+                    answer_source=result.answer_source,
+                )
+            )
+        before = len(project.facts)
+        for observation in observations:
+            Dispatcher._add_prior_fact(project, observation)
+        return len(project.facts) - before
+
+    @classmethod
+    def _persist_json_facts_from_detail(cls, project: Project, detail: str | None) -> int:
+        if not detail or cls._OUTPUT_TAIL_MARKER not in detail:
+            return 0
+        tail = detail.split(cls._OUTPUT_TAIL_MARKER, 1)[1]
+        try:
+            parsed = parse_worker_result(tail)
+        except ValueError:
+            return 0
+        return cls._store_worker_observations(project, parsed)
+
+    @staticmethod
+    def _reason_result_from_repair(exc: ReasonFormatError) -> ReasonResult | None:
+        repaired = repair_reason_output(getattr(exc, "output", "") or "")
+        if not repaired:
+            return None
+        try:
+            return parse_reason_result(repaired)
+        except (ReasonFormatError, ValueError):
+            return None
+
+    @staticmethod
     def _add_prior_fact(project: Project, observation: WorkerObservation) -> None:
         fact_text = _optional_fact_description(observation.fact_description)
         if not fact_text and observation.answer:
             fact_text = f"agent reported possible final answer: {observation.answer}"
         if not fact_text:
             return
+        if observation.answer_source:
+            fact_text = f"{fact_text}\nsource: {observation.answer_source}"
         if observation.outcome == "refuted":
             project.add_fact(fact_text, kind=FactKind.REFUTED)
             return
@@ -845,6 +962,41 @@ class Dispatcher:
             return self.reasoner.plan(project, log=self._agent_log(project.id))  # type: ignore[call-arg]
         return self.reasoner.plan(project)
 
+    @staticmethod
+    def _is_timeout_failure(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return "timed out" in text or "without stdout/stderr" in text
+
+    def _reason_timeout_failure(
+        self,
+        project: Project,
+        exc: Exception,
+        release_project: bool,
+    ) -> DispatchResult:
+        self._reason_salvage_failures += 1
+        self._persist_step(project, release_project=release_project)
+        self._log(
+            project.id,
+            f"reason timed out "
+            f"({self._reason_salvage_failures}/{self.max_reason_salvage_failures}); will retry",
+            "warning",
+            {"error": str(exc)},
+        )
+        if self._reason_salvage_failures >= self.max_reason_salvage_failures:
+            self._log(project.id, "reason kept timing out; dispatcher will stop", "error")
+            return DispatchResult(
+                project.id,
+                DispatchMode.SKIPPED,
+                project.status,
+                "reason timed out repeatedly without producing a plan",
+            )
+        return DispatchResult(
+            project.id,
+            DispatchMode.REASON,
+            project.status,
+            "reason timed out; will retry",
+        )
+
     def _reason_format_failure(
         self,
         project: Project,
@@ -914,10 +1066,14 @@ class Dispatcher:
     def _worker_result_fact_text(result: WorkerResult) -> str | None:
         fact_description = _optional_fact_description(result.fact_description)
         if fact_description:
-            return fact_description
-        if result.answer:
-            return f"agent reported possible final answer: {result.answer}"
-        return None
+            text = fact_description
+        elif result.answer:
+            text = f"agent reported possible final answer: {result.answer}"
+        else:
+            return None
+        if result.answer_source:
+            text = f"{text}\nsource: {result.answer_source}"
+        return text
 
     @staticmethod
     def _set_end_fact_result(project: Project, answer: str) -> None:
@@ -936,9 +1092,7 @@ class Dispatcher:
             (
                 fact
                 for fact in sorted(project.facts.values(), key=lambda item: item.id, reverse=True)
-                if fact.kind == FactKind.EVIDENCE
-                and not fact.description.startswith(Dispatcher._PARTIAL_OUTPUT_PREFIX)
-                and answer_text in fact.description
+                if Dispatcher._fact_supports_answer(fact, answer_text)
             ),
             None,
         )

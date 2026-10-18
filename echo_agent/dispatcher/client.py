@@ -14,8 +14,9 @@ class ProjectAPIError(RuntimeError):
 
 
 class ProjectClient:
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, auth_token: str | None = None) -> None:
         self.base_url = base_url.rstrip("/")
+        self.auth_token = auth_token or None
 
     def list_projects(self) -> list[Project]:
         return [Project.from_dict(item) for item in self._request("GET", "/projects")]
@@ -136,6 +137,8 @@ class ProjectClient:
             method=method,
             headers={"Content-Type": "application/json"},
         )
+        if self.auth_token:
+            request.add_header("X-Echo-Agent-Token", self.auth_token)
         last_error: URLError | None = None
         for attempt in range(3):
             try:

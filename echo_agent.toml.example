@@ -7,6 +7,10 @@
 host = "127.0.0.1"
 port = 8000
 
+# Optional API token. When set, /projects* requires header X-Echo-Agent-Token.
+# Recommended when workers run in Docker and can otherwise reach this API on the host.
+# auth_token = ""
+
 # SQLite database path. Runtime state under .echo_agent/ should not be committed.
 database_path = ".echo_agent/echo_agent.db"
 
@@ -49,7 +53,7 @@ timeout_seconds = 1800
 no_output_timeout_seconds = 900
 first_run_no_output_timeout_seconds = 900
 explore_no_output_timeout_seconds = 180
-reason_no_output_timeout_seconds = 300
+reason_no_output_timeout_seconds = 900
 
 # Prefer OPENAI_API_KEY / ECHO_AGENT_OPENAI_API_KEY instead of storing a key here.
 api_key = ""

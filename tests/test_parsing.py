@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import unittest
 
+from echo_agent.dispatcher.agents import answer_source_context
 from echo_agent.dispatcher.parsing import (
     ReasonFormatError,
     extract_mode_json_output,
     extract_mode_json_outputs,
     parse_reason_result,
     parse_worker_result,
+    repair_reason_output,
 )
 
 
@@ -306,6 +308,33 @@ class DispatcherParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "prompt template intents"):
             parse_reason_result(json.dumps(payload, ensure_ascii=False))
 
+
+
+
+    def test_repair_reason_output_accepts_fenced_trailing_comma(self) -> None:
+        raw = """思考过程
+```json
+{"completed": false, "next_intents": [{"description": "枚举",}]}
+```
+"""
+        repaired = repair_reason_output(raw)
+        self.assertIsNotNone(repaired)
+        result = parse_reason_result(repaired or "")
+        self.assertEqual(result.next_intents[0]["description"], "枚举")
+
+    def test_repair_reason_output_rejects_plain_prose(self) -> None:
+        self.assertIsNone(repair_reason_output("这里只有推理，没有 JSON"))
+
+    def test_answer_source_ignores_result_json_only(self) -> None:
+        raw = '{"answer": "flag{onlyjson}", "fact_description": null, "outcome": "verified"}'
+        self.assertIsNone(answer_source_context(raw, "flag{onlyjson}"))
+
+    def test_answer_source_uses_text_outside_result_json(self) -> None:
+        raw = 'HTTP/1.1 200\nbody flag{real}\n{"answer": "flag{real}", "fact_description": null, "outcome": "verified"}'
+        context = answer_source_context(raw, "flag{real}")
+        self.assertIsNotNone(context)
+        self.assertIn("flag{real}", context or "")
+        self.assertNotIn("fact_description", context or "")
 
 
 if __name__ == "__main__":

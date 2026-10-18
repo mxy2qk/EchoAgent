@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 import time
 from http import HTTPStatus
 from pathlib import Path
@@ -26,10 +27,10 @@ class MissingServerDependencyError(RuntimeError):
     pass
 
 
-def create_app(store: SQLiteProjectStore) -> Any:
+def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
     try:
         from fastapi import FastAPI, HTTPException
-        from fastapi.responses import FileResponse
+        from fastapi.responses import FileResponse, JSONResponse
         from fastapi.staticfiles import StaticFiles
     except ModuleNotFoundError as exc:
         raise MissingServerDependencyError(
@@ -44,6 +45,17 @@ def create_app(store: SQLiteProjectStore) -> Any:
     app.state.dispatcher_runner = DispatcherRunner(store, runtime=app.state.project_runtime)
     static_dir = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+    if auth_token:
+        @app.middleware("http")
+        async def _require_auth_token(request, call_next):  # type: ignore[no-untyped-def]
+            path = request.url.path
+            if path in {"/", "/health"} or path.startswith("/static"):
+                return await call_next(request)
+            provided = request.headers.get("x-echo-agent-token", "")
+            if not secrets.compare_digest(provided, auth_token):
+                return JSONResponse({"detail": "unauthorized"}, status_code=401)
+            return await call_next(request)
 
     def apply_project_status_transition(project: Project, old_project: Project) -> None:
         if old_project.status == project.status:
@@ -289,5 +301,5 @@ class UvicornServerHandle:
         return int(sockets[0].getsockname()[1])
 
 
-def create_server(host: str, port: int, database_path: str) -> UvicornServerHandle:
-    return UvicornServerHandle(host, port, create_app(SQLiteProjectStore(database_path)))
+def create_server(host: str, port: int, database_path: str, auth_token: str | None = None) -> UvicornServerHandle:
+    return UvicornServerHandle(host, port, create_app(SQLiteProjectStore(database_path), auth_token=auth_token))

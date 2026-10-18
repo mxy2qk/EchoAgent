@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Literal
 
 from echo_agent.dispatcher.types import ReasonResult, WorkerObservation, WorkerResult
@@ -17,6 +18,10 @@ class ReasonFormatError(ValueError):
 
     这是模型输出格式问题，不应当累计成基础设施失败。
     """
+
+    def __init__(self, message: str, output: str = "") -> None:
+        super().__init__(message)
+        self.output = output
 
 
 def is_template_reason_intent(item: dict[str, object]) -> bool:
@@ -91,7 +96,7 @@ def _parse_json_object(output: str, mode: Literal["explore", "reason"]) -> dict[
     matches = _matching_json_objects(output, mode)
     if not matches:
         if mode == "reason":
-            raise ReasonFormatError("reason output does not contain a JSON object")
+            raise ReasonFormatError("reason output does not contain a JSON object", output=output)
         raise ValueError(f"{mode} output does not contain a JSON object")
     data = matches[-1]
     if not isinstance(data, dict):
@@ -296,6 +301,49 @@ def _optional_fact_description(value: object) -> str | None:
     if normalized in placeholder_facts:
         return None
     return text
+
+
+def repair_reason_output(output: str) -> str | None:
+    """把围栏或尾逗号修成可解析的 reason JSON。修不好就返回 None，不重跑规划。"""
+    text = output.strip()
+    if not text:
+        return None
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
+    elif text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    try:
+        parse_reason_result(text)
+    except (ReasonFormatError, ValueError, json.JSONDecodeError):
+        return None
+    return text
+
+
+def strip_result_json_text(text: str) -> str:
+    """去掉 explore/reason 结果 JSON，只保留原始执行输出。"""
+    cleaned = text
+    decoder = json.JSONDecoder()
+    index = 0
+    while index < len(cleaned):
+        brace = cleaned.find("{", index)
+        if brace < 0:
+            break
+        try:
+            value, end = decoder.raw_decode(cleaned[brace:])
+        except json.JSONDecodeError:
+            index = brace + 1
+            continue
+        if isinstance(value, dict) and (
+            _matches_mode(value, "explore") or _matches_mode(value, "reason")
+        ):
+            cleaned = f"{cleaned[:brace]} {cleaned[brace + end:]}"
+            index = brace
+            continue
+        index = brace + end
+    return cleaned
 
 
 def is_template_worker_payload(data: dict[str, object]) -> bool:
