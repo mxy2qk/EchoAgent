@@ -21,8 +21,8 @@ class FirstRunPromptTests(unittest.TestCase):
         prompt = PromptBuilder().build_first_run_prompt(project, intent)  # type: ignore[arg-type]
 
         # 允许中途多次输出 JSON：超时被中断时，已确认的事实仍能被 salvage 成 fact。
-        self.assertIn("允许在同一次执行中输出多个 JSON", prompt)
-        self.assertIn("已确认的事实也不会丢失", prompt)
+        self.assertIn("同一次执行可以输出多个 JSON", prompt)
+        self.assertIn("结束时再输出最后一个总结", prompt)
         self.assertIn('"fact_description"', prompt)
 
     def test_explore_prompt_still_single_result(self) -> None:
@@ -61,7 +61,7 @@ class ReasonContextBudgetTests(unittest.TestCase):
         prompt = PromptBuilder().build_reason_prompt(project)
 
         self.assertIn("source:", prompt)
-        self.assertIn("不要仅因为", prompt)
+        self.assertIn("只能用来核验答案是否真实出现过", prompt)
 
 
 if __name__ == "__main__":

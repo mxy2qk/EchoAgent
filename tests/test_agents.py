@@ -209,6 +209,30 @@ time.sleep(5)
         self.assertEqual(agent._no_output_timeout_for_mode(DispatchMode.EXPLORE), 1)
         self.assertEqual(agent._no_output_timeout_for_mode(DispatchMode.FIRST_RUN), 900)
 
+    def test_mode_specific_timeout_overrides_default(self) -> None:
+        agent = CodexDockerAgent(
+            timeout_seconds=30,
+            mode_timeout_seconds={"first_run": 1},
+        )
+
+        self.assertEqual(agent._timeout_for_mode(DispatchMode.FIRST_RUN), 1)
+        self.assertEqual(agent._timeout_for_mode(DispatchMode.EXPLORE), 30)
+
+    def test_nonzero_exit_without_json_marks_upstream_overload_transient(self) -> None:
+        agent = CodexDockerAgent(timeout_seconds=5)
+        with self.assertRaisesRegex(RuntimeError, "transient upstream failure"):
+            agent._run_process(
+                (
+                    "sh",
+                    "-c",
+                    "cat >/dev/null; echo 'provider overloaded while reconnecting' >&2; exit 1",
+                ),
+                prompt="hello",
+                mode=DispatchMode.EXPLORE,
+                env=None,
+                log=None,
+            )
+
 
     def test_intent_command_uses_isolated_codex_home_and_workspace(self) -> None:
         agent = CodexDockerAgent(workspace="/home/kali/workspace")

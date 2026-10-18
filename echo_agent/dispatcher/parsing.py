@@ -1,17 +1,33 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Literal
 
 from echo_agent.dispatcher.types import ReasonResult, WorkerObservation, WorkerResult
+from echo_agent.models import normalize_action_key
+
+TEMPLATE_REASON_INTENTS: tuple[tuple[str, str], ...] = (
+    ("check-upload", "分析是否存在文件上传漏洞"),
+    ("enum-backup", "枚举 Web 目录和敏感备份文件"),
+)
 
 
 class ReasonFormatError(ValueError):
-    """reason 输出中没有可用的 JSON 对象。
+    """reason 输出里没有可解析的 JSON 对象。
 
-    与上游/网络等基础设施故障区分开：这是**模型的输出格式问题**，
-    调用方应做格式纠错重试，而不是把它累计成致命失败直接终止运行。
+    这是模型输出格式问题，不应当累计成基础设施失败。
     """
+
+    def __init__(self, message: str, output: str = "") -> None:
+        super().__init__(message)
+        self.output = output
+
+
+def is_template_reason_intent(item: dict[str, object]) -> bool:
+    description = " ".join(str(item.get("description") or "").split())
+    action_key = normalize_action_key(item.get("action_key"))
+    return (action_key, description) in TEMPLATE_REASON_INTENTS
 
 
 def parse_worker_result(output: str) -> WorkerResult:
@@ -63,10 +79,13 @@ def parse_reason_result(output: str) -> ReasonResult:
     if not isinstance(completed, bool):
         raise ValueError("reason output completed must be a boolean")
     intents = _parse_reason_intents(data)
+    kept = [item for item in intents if not is_template_reason_intent(item)]
+    if intents and not kept and not completed:
+        raise ValueError("reason output only contains prompt template intents")
     return ReasonResult(
         completed=completed,
-        next_intent_descriptions=[str(item["description"]) for item in intents],
-        next_intents=intents,
+        next_intent_descriptions=[str(item["description"]) for item in kept],
+        next_intents=kept,
         answer=_optional_answer(data.get("answer")),
         stop_reason=_optional_reason_text(data.get("stop_reason"), "stop_reason"),
         raw_output=output,
@@ -77,7 +96,7 @@ def _parse_json_object(output: str, mode: Literal["explore", "reason"]) -> dict[
     matches = _matching_json_objects(output, mode)
     if not matches:
         if mode == "reason":
-            raise ReasonFormatError("reason output does not contain a JSON object")
+            raise ReasonFormatError("reason output does not contain a JSON object", output=output)
         raise ValueError(f"{mode} output does not contain a JSON object")
     data = matches[-1]
     if not isinstance(data, dict):
@@ -204,7 +223,7 @@ def _parse_reason_intents(data: dict[str, object]) -> list[dict[str, object]]:
     for item in raw_items:
         if isinstance(item, str):
             description = item.strip()
-            if description and not is_template_reason_intent(description, ""):
+            if description:
                 intents.append({"description": description, "from": None, "to": None, "action_key": ""})
             continue
         if not isinstance(item, dict):
@@ -212,15 +231,12 @@ def _parse_reason_intents(data: dict[str, object]) -> list[dict[str, object]]:
         description = _optional_str(item.get("description"))
         if not description:
             raise ValueError("reason output next_intents object description is required")
-        action_key = _optional_reason_text(item.get("action_key"), "action_key")
-        if is_template_reason_intent(description, action_key):
-            continue
         intents.append(
             {
                 "description": description,
                 "from": _optional_int(item.get("from")),
                 "to": _optional_int(item.get("to")),
-                "action_key": action_key,
+                "action_key": _optional_reason_text(item.get("action_key"), "action_key"),
             }
         )
     return intents
@@ -287,26 +303,55 @@ def _optional_fact_description(value: object) -> str | None:
     return text
 
 
+def repair_reason_output(output: str) -> str | None:
+    """把围栏或尾逗号修成可解析的 reason JSON。修不好就返回 None，不重跑规划。"""
+    text = output.strip()
+    if not text:
+        return None
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
+    elif text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    try:
+        parse_reason_result(text)
+    except (ReasonFormatError, ValueError, json.JSONDecodeError):
+        return None
+    return text
+
+
+def strip_result_json_text(text: str) -> str:
+    """去掉 explore/reason 结果 JSON，只保留原始执行输出。"""
+    cleaned = text
+    decoder = json.JSONDecoder()
+    index = 0
+    while index < len(cleaned):
+        brace = cleaned.find("{", index)
+        if brace < 0:
+            break
+        try:
+            value, end = decoder.raw_decode(cleaned[brace:])
+        except json.JSONDecodeError:
+            index = brace + 1
+            continue
+        if isinstance(value, dict) and (
+            _matches_mode(value, "explore") or _matches_mode(value, "reason")
+        ):
+            cleaned = f"{cleaned[:brace]} {cleaned[brace + end:]}"
+            index = brace
+            continue
+        index = brace + end
+    return cleaned
+
+
 def is_template_worker_payload(data: dict[str, object]) -> bool:
     if _optional_fact_description(data.get("fact_description")) is not None:
         return False
     if _optional_answer(data.get("answer")) is not None:
         return False
     return "answer" in data or "fact_description" in data or "outcome" in data
-
-
-# reason prompt（prompts.py 的 build_reason_prompt）里示例 JSON 的逐字内容。
-# salvage / 回显 会把示例混进 reason 输出，若不剔除就会被当成真实规划去执行。
-_REASON_TEMPLATE_INTENTS = {
-    ("check-upload", "分析是否存在文件上传漏洞"),
-    ("enum-backup", "枚举 Web 目录和敏感备份文件"),
-}
-
-
-def is_template_reason_intent(description: object, action_key: object) -> bool:
-    normalized_description = " ".join(str(description or "").split())
-    normalized_key = str(action_key or "").strip().casefold()
-    return (normalized_key, normalized_description) in _REASON_TEMPLATE_INTENTS
 
 
 def substantive_worker_output(output: str) -> str | None:

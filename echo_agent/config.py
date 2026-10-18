@@ -86,10 +86,6 @@ class DispatcherSettings:
     @classmethod
     def from_env(cls) -> "DispatcherSettings":
         config = _load_config()
-        # 全局墙钟；per-mode 未单独配置时回退到它（BUG-005：first_run 可单独放宽）。
-        codex_timeout = int(
-            _setting("ECHO_AGENT_CODEX_TIMEOUT", config, "codex", "timeout_seconds")
-        )
         return cls(
             server_url=_setting(
                 "ECHO_AGENT_SERVER_URL", config, "dispatcher", "server_url"
@@ -135,7 +131,14 @@ class DispatcherSettings:
             codex_workspace=_setting(
                 "ECHO_AGENT_CODEX_WORKSPACE", config, "codex", "workspace"
             ),
-            codex_timeout_seconds=codex_timeout,
+            codex_timeout_seconds=int(
+                _setting(
+                    "ECHO_AGENT_CODEX_TIMEOUT",
+                    config,
+                    "codex",
+                    "timeout_seconds",
+                )
+            ),
             codex_first_run_timeout_seconds=int(
                 _optional_config_setting(
                     "ECHO_AGENT_CODEX_FIRST_RUN_TIMEOUT",
@@ -143,7 +146,7 @@ class DispatcherSettings:
                     "codex",
                     "first_run_timeout_seconds",
                 )
-                or codex_timeout
+                or _setting("ECHO_AGENT_CODEX_TIMEOUT", config, "codex", "timeout_seconds")
             ),
             codex_explore_timeout_seconds=int(
                 _optional_config_setting(
@@ -152,7 +155,7 @@ class DispatcherSettings:
                     "codex",
                     "explore_timeout_seconds",
                 )
-                or codex_timeout
+                or _setting("ECHO_AGENT_CODEX_TIMEOUT", config, "codex", "timeout_seconds")
             ),
             codex_reason_timeout_seconds=int(
                 _optional_config_setting(
@@ -161,7 +164,7 @@ class DispatcherSettings:
                     "codex",
                     "reason_timeout_seconds",
                 )
-                or codex_timeout
+                or _setting("ECHO_AGENT_CODEX_TIMEOUT", config, "codex", "timeout_seconds")
             ),
             codex_no_output_timeout_seconds=int(
                 _setting(

@@ -47,8 +47,6 @@ def create_app(store: SQLiteProjectStore, auth_token: str | None = None) -> Any:
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     if auth_token:
-        # 只保护数据/控制接口；首页与静态资源保持开放，前端自行携带 token。
-        # 目的：worker 容器内的 agent 即使能经宿主机代理打到本机端口，也拿不到项目数据。
         @app.middleware("http")
         async def _require_auth_token(request, call_next):  # type: ignore[no-untyped-def]
             path = request.url.path

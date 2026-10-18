@@ -12,9 +12,12 @@ from collections import deque
 from typing import Mapping, Sequence
 
 from echo_agent.dispatcher.parsing import (
+    ReasonFormatError,
     extract_mode_json_output,
     parse_reason_result,
     parse_worker_result,
+    repair_reason_output,
+    strip_result_json_text,
     substantive_worker_output,
 )
 from echo_agent.dispatcher.prompts import PromptBuilder
@@ -29,9 +32,6 @@ from echo_agent.dispatcher.types import (
 from echo_agent.models import Intent, Project
 
 
-# 上游过载 / 流中断等**瞬时**错误：重试即可恢复，不应把 intent 直接判死（BUG-010）。
-# 命中这些标记时抛出的异常会带上 "transient upstream failure"，
-# 由调度层 core._is_retryable_failure 识别并走重试预算。
 TRANSIENT_UPSTREAM_MARKERS = (
     "high demand",
     "overloaded",
@@ -90,7 +90,6 @@ class CodexDockerAgent:
             self._mode_key(key): int(value)
             for key, value in (mode_no_output_timeout_seconds or {}).items()
         }
-        # per-mode 墙钟：未配置的模式回退到全局 timeout_seconds（BUG-005）。
         self.mode_timeout_seconds = {
             self._mode_key(key): int(value)
             for key, value in (mode_timeout_seconds or {}).items()
@@ -99,8 +98,7 @@ class CodexDockerAgent:
         self._preflight_ready: set[str] = set()
         self._process_lock = threading.Lock()
         self._processes: list[subprocess.Popen[str]] = []
-        # 最近一次 _consume_process 是否走了 salvage 路径（超时/非零退出）。
-        self._last_salvaged = False
+        self._run_state = threading.local()
 
     def run(
         self,
@@ -131,14 +129,20 @@ class CodexDockerAgent:
                 "runtime_key": runtime_key,
                 "command": self._safe_command(command),
                 "model": self.mode_models.get(mode.value, self.model),
-                "timeout_seconds": self.timeout_seconds,
+                "timeout_seconds": self._timeout_for_mode(mode),
                 "no_output_timeout_seconds": self._no_output_timeout_for_mode(mode),
                 "prompt_chars": len(prompt),
             },
         )
         output = self._run_process(command, prompt, mode, env=env, log=log)
         self._log(log, f"codex agent process finished in {mode.value} mode", metadata={"output_chars": len(output)})
-        return AgentRunResult(output=output, salvaged=self._last_salvaged)
+        state = self._run_state
+        return AgentRunResult(
+            output=output,
+            salvaged=bool(getattr(state, "salvaged", False)),
+            timed_out=bool(getattr(state, "timed_out", False)),
+            raw_output=str(getattr(state, "raw_output", "") or output),
+        )
 
     def intent_runtime_paths(self, intent_id: int) -> tuple[str, str]:
         return self.runtime_paths(f"intents/{intent_id}")
@@ -319,7 +323,7 @@ class CodexDockerAgent:
         mode: DispatchMode,
         log: AgentLogCallback | None,
     ) -> str:
-        self._last_salvaged = False
+        self._remember_run(salvaged=False, timed_out=False, raw_output="")
         assert process.stdin is not None
         assert process.stdout is not None
         assert process.stderr is not None
@@ -425,7 +429,7 @@ class CodexDockerAgent:
                         "warning",
                         {"timeout_seconds": timeout_seconds, "output_lines": output_count},
                     )
-                    self._last_salvaged = True
+                    self._remember_run(salvaged=True, timed_out=True, raw_output=combined)
                     return salvaged
                 self._log(
                     log,
@@ -463,7 +467,7 @@ class CodexDockerAgent:
                             "output_lines": output_count,
                         },
                     )
-                    self._last_salvaged = True
+                    self._remember_run(salvaged=True, timed_out=True, raw_output=combined)
                     return salvaged
                 self._log(
                     log,
@@ -536,11 +540,9 @@ class CodexDockerAgent:
                     "warning",
                     {"recent_output": detail},
                 )
-                self._last_salvaged = True
+                self._remember_run(salvaged=True, timed_out=False, raw_output=combined)
                 return salvaged_output
             if any(marker in combined.lower() for marker in TRANSIENT_UPSTREAM_MARKERS):
-                # 上游过载 / 流中断：属瞬时故障，交给调度层的重试预算处理，
-                # 不要把它当成「这个 intent 本身失败」而永久判死（BUG-010）。
                 self._log(
                     log,
                     f"codex agent transient upstream failure in {mode.value} mode "
@@ -559,7 +561,13 @@ class CodexDockerAgent:
                 {"recent_output": detail},
             )
             raise RuntimeError(f"codex agent failed in {mode.value} mode with exit code {return_code}: {detail}")
+        self._remember_run(salvaged=False, timed_out=False, raw_output=output)
         return output
+
+    def _remember_run(self, *, salvaged: bool, timed_out: bool, raw_output: str) -> None:
+        self._run_state.salvaged = salvaged
+        self._run_state.timed_out = timed_out
+        self._run_state.raw_output = raw_output
 
     @classmethod
     def _salvaged_output(cls, text: str, mode: DispatchMode) -> str | None:
@@ -711,13 +719,13 @@ class CodexWorker:
         prompt = f"{prompt}\n\n{self._isolation_note(intent.id)}"
         result = _invoke_agent(self.agent, project, prompt, mode, log, intent_id=intent.id)
         parsed = parse_worker_result(result.output)
-        # 把答案在原始输出中的上下文一并带上：否则落盘后只剩「模型声称」，
-        # reason 无法核验，只能拒绝完成（BUG-014）。
+        parsed.timed_out = bool(getattr(result, "timed_out", False))
+        raw_output = getattr(result, "raw_output", "") or result.output
         if parsed.answer:
-            parsed.answer_source = answer_source_context(result.output, parsed.answer)
+            parsed.answer_source = answer_source_context(raw_output, parsed.answer)
         for prior in parsed.prior_results:
             if prior.answer and not prior.answer_source:
-                prior.answer_source = answer_source_context(result.output, prior.answer)
+                prior.answer_source = answer_source_context(raw_output, prior.answer)
         return parsed
 
     @staticmethod
@@ -742,9 +750,14 @@ class CodexReasoner:
             "不要杀死其他进程，不要修改其他 intent 目录。"
         )
         result = _invoke_agent(self.agent, project, prompt, DispatchMode.REASON, log, runtime_key="reason")
-        parsed = parse_reason_result(result.output)
-        # 标记该结果是否来自超时/中断后的 salvage：空规划在此情况下不代表「没有方向」。
-        parsed.salvaged = bool(getattr(result, "salvaged", False))
+        try:
+            parsed = parse_reason_result(result.output)
+        except ReasonFormatError as exc:
+            repaired = repair_reason_output(exc.output or result.output)
+            if repaired is None:
+                raise
+            parsed = parse_reason_result(repaired)
+        parsed.salvaged = bool(getattr(result, "timed_out", False))
         return parsed
 
 
@@ -753,16 +766,17 @@ _ANSWER_SOURCE_CONTEXT_CHARS = 240
 
 
 def answer_source_context(raw_output: str, answer: str | None) -> str | None:
-    """从原始输出中截取答案出现位置前后的片段，作为答案来源证据。"""
+    """从去掉结果 JSON 后的原始输出里截取答案上下文。只出现在结果 JSON 中则返回 None。"""
     text = (answer or "").strip()
     if not text or not raw_output:
         return None
-    index = raw_output.find(text)
+    cleaned = strip_result_json_text(raw_output)
+    index = cleaned.find(text)
     if index < 0:
         return None
     start = max(0, index - _ANSWER_SOURCE_CONTEXT_CHARS)
-    end = min(len(raw_output), index + len(text) + _ANSWER_SOURCE_CONTEXT_CHARS)
-    snippet = " ".join(raw_output[start:end].split())
+    end = min(len(cleaned), index + len(text) + _ANSWER_SOURCE_CONTEXT_CHARS)
+    snippet = " ".join(cleaned[start:end].split())
     return snippet or None
 
 

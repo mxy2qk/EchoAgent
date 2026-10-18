@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import unittest
 
-from echo_agent.dispatcher.parsing import extract_mode_json_output, extract_mode_json_outputs, parse_reason_result, parse_worker_result
+from echo_agent.dispatcher.agents import answer_source_context
+from echo_agent.dispatcher.parsing import (
+    ReasonFormatError,
+    extract_mode_json_output,
+    extract_mode_json_outputs,
+    parse_reason_result,
+    parse_worker_result,
+    repair_reason_output,
+)
 
 
 class DispatcherParsingTests(unittest.TestCase):
@@ -226,6 +234,107 @@ class DispatcherParsingTests(unittest.TestCase):
         self.assertEqual(result.fact_description, "内网 MySQL 5.7.29:3306")
         self.assertEqual(result.outcome, "verified")
         self.assertEqual(result.prior_results, [])
+
+
+    def test_reason_output_drops_exact_prompt_template_intents(self) -> None:
+        import json
+
+        template = {
+            "completed": False,
+            "next_intents": [
+                {
+                    "from": 2,
+                    "to": None,
+                    "action_key": "check-upload",
+                    "description": "分析是否存在文件上传漏洞",
+                },
+                {
+                    "from": 2,
+                    "to": None,
+                    "action_key": "enum-backup",
+                    "description": "枚举 Web 目录和敏感备份文件",
+                },
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "prompt template intents"):
+            parse_reason_result(json.dumps(template, ensure_ascii=False))
+
+        mixed = {
+            "completed": False,
+            "next_intents": template["next_intents"]
+            + [
+                {
+                    "from": 2,
+                    "to": None,
+                    "action_key": "check-upload",
+                    "description": "只请求 /upload 一次并在十秒内停止",
+                }
+            ],
+        }
+        result = parse_reason_result(json.dumps(mixed, ensure_ascii=False))
+        self.assertEqual(len(result.next_intents or []), 1)
+        self.assertEqual(result.next_intents[0]["description"], "只请求 /upload 一次并在十秒内停止")
+        self.assertEqual(result.next_intents[0]["action_key"], "check-upload")
+
+        completed = dict(template)
+        completed["completed"] = True
+        completed["answer"] = "flag{ok}"
+        result = parse_reason_result(json.dumps(completed, ensure_ascii=False))
+        self.assertTrue(result.completed)
+        self.assertEqual(result.next_intents, [])
+
+        empty = {"completed": False, "next_intents": []}
+        result = parse_reason_result(json.dumps(empty, ensure_ascii=False))
+        self.assertEqual(result.next_intents, [])
+
+    def test_reason_output_without_json_is_a_format_error(self) -> None:
+        with self.assertRaises(ReasonFormatError):
+            parse_reason_result("我先分析一下，暂时不给 JSON")
+
+    def test_reason_template_match_ignores_key_case_and_extra_space(self) -> None:
+        import json
+
+        payload = {
+            "completed": False,
+            "next_intents": [
+                {
+                    "from": 2,
+                    "to": None,
+                    "action_key": "CHECK_UPLOAD",
+                    "description": "  分析是否存在文件上传漏洞  ",
+                }
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "prompt template intents"):
+            parse_reason_result(json.dumps(payload, ensure_ascii=False))
+
+
+
+
+    def test_repair_reason_output_accepts_fenced_trailing_comma(self) -> None:
+        raw = """思考过程
+```json
+{"completed": false, "next_intents": [{"description": "枚举",}]}
+```
+"""
+        repaired = repair_reason_output(raw)
+        self.assertIsNotNone(repaired)
+        result = parse_reason_result(repaired or "")
+        self.assertEqual(result.next_intents[0]["description"], "枚举")
+
+    def test_repair_reason_output_rejects_plain_prose(self) -> None:
+        self.assertIsNone(repair_reason_output("这里只有推理，没有 JSON"))
+
+    def test_answer_source_ignores_result_json_only(self) -> None:
+        raw = '{"answer": "flag{onlyjson}", "fact_description": null, "outcome": "verified"}'
+        self.assertIsNone(answer_source_context(raw, "flag{onlyjson}"))
+
+    def test_answer_source_uses_text_outside_result_json(self) -> None:
+        raw = 'HTTP/1.1 200\nbody flag{real}\n{"answer": "flag{real}", "fact_description": null, "outcome": "verified"}'
+        context = answer_source_context(raw, "flag{real}")
+        self.assertIsNotNone(context)
+        self.assertIn("flag{real}", context or "")
+        self.assertNotIn("fact_description", context or "")
 
 
 if __name__ == "__main__":

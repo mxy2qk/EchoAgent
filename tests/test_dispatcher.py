@@ -7,6 +7,7 @@ import unittest
 from typing import Any
 
 from echo_agent.dispatcher.core import Dispatcher
+from echo_agent.dispatcher.parsing import ReasonFormatError
 from echo_agent.dispatcher.prompts import PromptBuilder
 from echo_agent.dispatcher.types import DispatchMode, ReasonResult, WorkerObservation, WorkerResult
 from echo_agent.models import (
@@ -116,6 +117,14 @@ class CompletedReasoner:
 class FlagReasoner:
     def plan(self, project: Project) -> ReasonResult:
         return ReasonResult(completed=True, answer="flag{reason}", next_intents=[])
+
+
+class FixedAnswerReasoner:
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(completed=True, answer=self.answer, next_intents=[])
 
 
 class GraphAnswerReasoner:
@@ -384,7 +393,7 @@ class DispatcherFactInsertionTests(unittest.TestCase):
         project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
         project.add_fact("start", fact_id=0)
         project.add_fact("goal", fact_id=1)
-        project.add_fact("agent reported possible final answer: flag{graph}", fact_id=2)
+        project.add_fact("HTTP response contained flag{graph}", fact_id=2)
         seed_intent = project.add_intent("initial discovery", from_fact_id=0, to_fact_id=2)
         seed_intent.mark_running()
         seed_intent.mark_completed()
@@ -392,7 +401,7 @@ class DispatcherFactInsertionTests(unittest.TestCase):
         dispatcher = Dispatcher(
             client=client,  # type: ignore[arg-type]
             worker=StaticWorker("unused"),  # type: ignore[arg-type]
-            reasoner=GraphAnswerReasoner(),  # type: ignore[arg-type]
+            reasoner=FixedAnswerReasoner("flag{graph}"),  # type: ignore[arg-type]
         )
 
         result = dispatcher.run_once(project.id)
@@ -440,16 +449,20 @@ class DispatcherFactInsertionTests(unittest.TestCase):
 
         results = dispatcher.run_loop(project.id, interval_seconds=0, max_steps=2)
 
-        self.assertEqual([result.mode for result in results], [DispatchMode.EXPLORE, DispatchMode.REASON])
+        self.assertEqual(
+            [result.mode for result in results],
+            [DispatchMode.EXPLORE, DispatchMode.REASON, DispatchMode.EXPLORE],
+        )
         saved = client.project
-        self.assertEqual(len([intent for intent in saved.intents.values() if intent.is_completed]), 5)
+        self.assertEqual(len([intent for intent in saved.intents.values() if intent.is_completed]), 7)
         branch_intents = [
             intent
             for intent in saved.intents.values()
-            if intent.from_fact_id == 2 and intent.is_executable
+            if intent.description in {"枚举目录", "测试上传点"}
         ]
         self.assertEqual([intent.description for intent in branch_intents], ["枚举目录", "测试上传点"])
-        self.assertTrue(all(intent.to_fact_id == 1 for intent in branch_intents))
+        self.assertTrue(all(intent.is_completed for intent in branch_intents))
+        self.assertTrue(all(intent.from_fact_id == 2 for intent in branch_intents))
 
     def test_reason_empty_plan_does_not_create_fallback_intent(self) -> None:
         project = self._project_ready_for_reason()
@@ -624,6 +637,18 @@ class RaisingReasoner:
         raise RuntimeError("HTTP 503 service unavailable")
 
 
+class FormatErrorReasoner:
+    def __init__(self, succeed_on: int | None = None) -> None:
+        self.calls = 0
+        self.succeed_on = succeed_on
+
+    def plan(self, project: Project) -> ReasonResult:
+        self.calls += 1
+        if self.succeed_on is not None and self.calls >= self.succeed_on:
+            return ReasonResult(completed=False, next_intents=[])
+        raise ReasonFormatError("reason output does not contain a JSON object")
+
+
 class ExplodingReasoner:
     def plan(self, project: Project) -> ReasonResult:
         raise AssertionError("reason should not run")
@@ -677,11 +702,16 @@ class OuterFailureTests(unittest.TestCase):
         self.assertTrue(
             Dispatcher._is_retryable_failure(RuntimeError("upstream returned HTTP 503 service unavailable"))
         )
+        self.assertTrue(Dispatcher._is_retryable_failure(RuntimeError("model is under high demand")))
+        self.assertTrue(
+            Dispatcher._is_retryable_failure(RuntimeError("stream disconnected before completion"))
+        )
         self.assertFalse(
             Dispatcher._is_retryable_failure(
                 RuntimeError("codex agent no-output timed out in explore mode after 900s without stdout/stderr")
             )
         )
+        self.assertFalse(Dispatcher._is_retryable_failure(RuntimeError("codex agent exited with code 1")))
 
     def test_reason_exception_does_not_escape_or_complete_project(self) -> None:
         project = DispatcherFactInsertionTests._project_ready_for_reason()
@@ -1110,12 +1140,19 @@ class GraphContractTests(unittest.TestCase):
 
         saved = client.project
         evidence = [fact for fact in saved.facts.values() if fact.kind == FactKind.EVIDENCE]
-        self.assertEqual(len(evidence), 1)
-        self.assertTrue(evidence[0].description.startswith("未完成执行的输出摘录："))
-        self.assertIn("confirmed hidden SSRF endpoint", evidence[0].description)
-        self.assertNotIn("该方向已验证不存在可利用点", evidence[0].description)
+        errors = [fact for fact in saved.facts.values() if fact.kind == FactKind.ERROR]
+        self.assertEqual(evidence, [])
+        self.assertEqual(len(errors), 1)
+        self.assertFalse(errors[0].is_plannable)
+        self.assertTrue(errors[0].description.startswith("未完成执行的输出摘录："))
+        self.assertIn("confirmed hidden SSRF endpoint", errors[0].description)
+        self.assertNotIn("该方向已验证不存在可利用点", errors[0].description)
         self.assertEqual(saved.intents[0].outcome, IntentOutcome.ERROR)
         self.assertFalse(any(fact.kind == FactKind.REFUTED for fact in saved.facts.values()))
+        prompt = PromptBuilder().build_reason_prompt(saved)
+        self.assertIn("confirmed hidden SSRF endpoint", prompt)
+        self.assertRegex(prompt, r'"allowed_from": \[\s*0\s*\]')
+        self.assertNotRegex(prompt, r'"allowed_from": \[[^\]]*\b2\b')
 
     def test_template_only_timeout_tail_stays_an_error(self) -> None:
         project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
@@ -1147,6 +1184,7 @@ class GraphContractTests(unittest.TestCase):
         Dispatcher._apply_intent_result(project, type("Item", (), {"intent": intent, "result": result})())
 
         self.assertFalse(any(fact.kind == FactKind.EVIDENCE for fact in project.facts.values()))
+        self.assertFalse(any(fact.kind == FactKind.ERROR for fact in project.facts.values()))
         self.assertEqual(intent.outcome, IntentOutcome.ERROR)
 
     def test_closed_from_without_producer_uses_start(self) -> None:
@@ -1194,6 +1232,52 @@ class TemplateRefutedWorker:
         return WorkerResult(fact_description="该方向已验证不存在可利用点", outcome="refuted")
 
 
+class TimeoutJsonWorker:
+    def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+        raise RuntimeError(
+            "codex agent timed out in first_run mode after 1800s\noutput_tail:\n"
+            '{"answer": null, "fact_description": "hidden SSRF endpoint /internal/fetch", "outcome": "verified"}\n'
+            '{"answer": null, "fact_description": "internal MySQL 5.7.29:3306", "outcome": "verified"}\n'
+            '{"answer": null, "fact_description": "该方向已验证不存在可利用点", "outcome": "refuted"}\n'
+        )
+
+
+class PartialTimeoutWorker:
+    def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+        return WorkerResult(
+            timed_out=True,
+            fact_description="internal MySQL 5.7.29:3306",
+            prior_results=[
+                WorkerObservation(
+                    fact_description="hidden SSRF endpoint /internal/fetch",
+                    outcome="verified",
+                )
+            ],
+        )
+
+
+class SalvagedEmptyReasoner:
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(completed=False, next_intents=[], salvaged=True)
+
+
+class TimeoutReasoner:
+    def plan(self, project: Project) -> ReasonResult:
+        raise RuntimeError("codex agent timed out in reason mode after 1800s")
+
+
+class RepairableReasoner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def plan(self, project: Project) -> ReasonResult:
+        self.calls += 1
+        raise ReasonFormatError(
+            "reason output does not contain a JSON object",
+            output='思考一下\n```json\n{"completed": false, "next_intents": [],}\n```',
+        )
+
+
 class TimeoutTailWorker:
     def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
         prose = "confirmed hidden SSRF endpoint at /internal/fetch and MySQL 5.7.29:3306"
@@ -1220,118 +1304,487 @@ class StopDuringExecutionWorker:
         return WorkerResult(fact_description="发现隐藏接口 /internal/fetch")
 
 
-class SalvagedEmptyReasoner:
-    """模拟：reason 因超时被 salvage，只得到空规划。"""
+class TemplateOnlyReasoner:
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(
+            completed=False,
+            next_intents=[
+                {
+                    "from": 2,
+                    "to": None,
+                    "action_key": "check-upload",
+                    "description": "分析是否存在文件上传漏洞",
+                },
+                {
+                    "from": 2,
+                    "to": None,
+                    "action_key": "enum-backup",
+                    "description": "枚举 Web 目录和敏感备份文件",
+                },
+            ],
+        )
+
+
+class MixedTemplateReasoner:
+    def plan(self, project: Project) -> ReasonResult:
+        return ReasonResult(
+            completed=False,
+            next_intents=[
+                {
+                    "from": 2,
+                    "to": None,
+                    "action_key": "check-upload",
+                    "description": "分析是否存在文件上传漏洞",
+                },
+                {
+                    "from": 2,
+                    "to": None,
+                    "action_key": "probe-header",
+                    "description": "只读取 /admin 的响应头",
+                },
+            ],
+        )
+
+
+class AlwaysPlanReasoner:
+    _descriptions = (
+        "读取首页 HTTP 状态码",
+        "枚举站点根目录里的备份文件",
+        "检查登录表单有哪些字段",
+    )
 
     def plan(self, project: Project) -> ReasonResult:
-        return ReasonResult(completed=False, next_intents=[], salvaged=True)
+        index = len(project.intents) - 1
+        description = self._descriptions[min(index, len(self._descriptions) - 1)]
+        return ReasonResult(
+            completed=False,
+            next_intents=[
+                {
+                    "from": 0,
+                    "to": None,
+                    "action_key": f"step-{index}",
+                    "description": description,
+                }
+            ],
+        )
 
 
-class ReasonSalvageProgressTests(unittest.TestCase):
-    @staticmethod
-    def _project_ready_for_reason() -> Project:
+class TargetDownWorker:
+    def execute_intent(self, project: Project, intent, mode: DispatchMode) -> WorkerResult:
+        return WorkerResult(outcome="error", detail="target not found")
+
+
+class OuterLoopFixTests(unittest.TestCase):
+    def test_template_reason_intents_are_not_planned(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=TemplateOnlyReasoner(),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id, release_project=False)
+
+        self.assertEqual(result.message, "planned 0 intents")
+        self.assertEqual(client.project.active_intents(), [])
+
+    def test_real_intent_survives_when_template_intent_is_mixed_in(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=MixedTemplateReasoner(),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id, release_project=False)
+
+        active = client.project.active_intents()
+        self.assertEqual(result.message, "planned 1 intents")
+        self.assertEqual([intent.description for intent in active], ["只读取 /admin 的响应头"])
+
+    def test_empty_reason_does_not_consume_step_budget(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=EmptyReasoner(),  # type: ignore[arg-type]
+            max_retryable_attempts=3,
+        )
+
+        results = dispatcher.run_loop(project.id, interval_seconds=0, max_steps=1)
+
+        self.assertEqual(results[-1].mode, DispatchMode.SKIPPED)
+        self.assertEqual(results[-1].message, "reason made no progress")
+        self.assertGreaterEqual(len(results), 3)
+        self.assertNotEqual(results[0].message, "project step budget exhausted")
+
+    def test_reason_failure_does_not_consume_step_budget(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=RaisingReasoner(),  # type: ignore[arg-type]
+            max_retryable_attempts=2,
+        )
+
+        results = dispatcher.run_loop(project.id, interval_seconds=0, max_steps=1)
+
+        self.assertEqual([result.message for result in results], ["reason failed; will retry", "reason failed repeatedly"])
+        self.assertEqual(results[-1].mode, DispatchMode.SKIPPED)
+
+    def test_run_loop_releases_project_when_step_raises(self) -> None:
         project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
         project.add_fact("start", fact_id=0)
         project.add_fact("goal", fact_id=1)
-        project.add_fact("web service exposes upload form", fact_id=2)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=EmptyReasoner(),  # type: ignore[arg-type]
+        )
+
+        def boom(project: Project, release_project: bool = False) -> None:
+            raise RuntimeError("step failed")
+
+        released: dict[str, int] = {}
+
+        def release(project_id: int) -> None:
+            released["id"] = project_id
+            raise RuntimeError("release failed")
+
+        dispatcher._run_project_step = boom  # type: ignore[method-assign]
+        dispatcher._release_project_if_running = release  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(RuntimeError, "step failed"):
+            dispatcher.run_loop(project.id, interval_seconds=0, max_steps=1)
+        self.assertEqual(released["id"], project.id)
+
+    def test_reason_step_logs_reason_mode(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=EmptyReasoner(),  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id, release_project=False)
+
+        self.assertTrue(any(log["message"] == "project entered reason mode" for log in client.logs))
+
+    def test_explore_step_logs_explore_mode(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_intent("探测首页", from_fact_id=0, to_fact_id=1)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("首页返回 200"),  # type: ignore[arg-type]
+            reasoner=EmptyReasoner(),  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id, release_project=False)
+
+        self.assertTrue(any(log["message"] == "project entered explore mode" for log in client.logs))
+
+    def test_target_not_found_three_times_skips(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_intent("确认目标在线", from_fact_id=0, to_fact_id=1, action_key="probe-0")
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=TargetDownWorker(),  # type: ignore[arg-type]
+            reasoner=AlwaysPlanReasoner(),  # type: ignore[arg-type]
+        )
+
+        results = dispatcher.run_loop(project.id, interval_seconds=0, max_steps=10)
+
+        self.assertEqual(
+            [result.mode for result in results],
+            [
+                DispatchMode.EXPLORE,
+                DispatchMode.REASON,
+                DispatchMode.EXPLORE,
+                DispatchMode.REASON,
+                DispatchMode.SKIPPED,
+            ],
+        )
+        self.assertEqual(results[-1].message, "target appears offline: target not found repeated 3 times")
+
+    def test_other_result_resets_target_offline_streak(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=EmptyReasoner(),  # type: ignore[arg-type]
+        )
+        dispatcher._target_offline_streak = 2
+        dispatcher._observe_target(WorkerResult(fact_description="found /admin"))
+        self.assertEqual(dispatcher._target_offline_streak, 0)
+        dispatcher._observe_target(WorkerResult(answer="Target Not Found"))
+        dispatcher._observe_target(WorkerResult(retryable=True))
+        self.assertEqual(dispatcher._target_offline_streak, 1)
+
+    def test_explore_prompt_hides_closed_fact_ids(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("发现上传点", fact_id=2)
+        closed = project.add_intent("检查上传点", from_fact_id=2, to_fact_id=1, action_key="check-upload")
+        finding = project.add_fact("上传点不存在可利用漏洞", kind=FactKind.REFUTED)
+        closed.mark_running()
+        closed.mark_completed(to_fact_id=finding.id, outcome=IntentOutcome.REFUTED)
+        active = project.add_intent("探测响应头", from_fact_id=2, to_fact_id=1, action_key="probe-header")
+
+        prompt = PromptBuilder().build_explore_prompt(project, active)
+
+        self.assertIn('"closed_actions"', prompt)
+        self.assertNotIn('"findings"', prompt)
+        self.assertNotIn('"already_done"', prompt)
+        self.assertNotIn('"do_not_repeat"', prompt)
+        self.assertNotIn('"id": 3', prompt)
+        self.assertIn("发现上传点", prompt)
+        self.assertIn("立刻输出 JSON", prompt)
+        self.assertIn("outcome=refuted", prompt)
+        self.assertIn("检查上传点", prompt)
+
+
+class FormatAndExcerptTests(unittest.TestCase):
+    def test_reason_format_error_retries_without_counting_as_infrastructure_failure(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        reasoner = FormatErrorReasoner()
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=reasoner,  # type: ignore[arg-type]
+            max_retryable_attempts=2,
+        )
+
+        results = dispatcher.run_loop(project.id, interval_seconds=0, max_steps=1)
+
+        self.assertEqual(reasoner.calls, 4)
+        self.assertEqual(results[0].message, "reason output was not JSON; will retry")
+        self.assertEqual(results[-1].mode, DispatchMode.SKIPPED)
+        self.assertIn("never a valid JSON object", results[-1].message)
+        self.assertNotIn("reason failed repeatedly", [result.message for result in results])
+        self.assertEqual(
+            [fact.description for fact in client.project.facts.values()],
+            ["start", "goal", "web service exposes upload form"],
+        )
+
+    def test_reason_format_error_accepts_the_immediate_retry(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        reasoner = FormatErrorReasoner(succeed_on=2)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=reasoner,  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id, release_project=False)
+
+        self.assertEqual(reasoner.calls, 2)
+        self.assertEqual(result.message, "planned 0 intents")
+        self.assertEqual(dispatcher._reason_format_failures, 0)
+
+    def test_partial_output_excerpt_cannot_satisfy_completion(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        project.add_fact(
+            "未完成执行的输出摘录：\nflag{reason}",
+            kind=FactKind.EVIDENCE,
+        )
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=FlagReasoner(),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id, release_project=False)
+
+        self.assertNotEqual(result.mode, DispatchMode.COMPLETED)
+        self.assertNotEqual(client.project.status, ProjectStatus.COMPLETED)
+
+    def test_timeout_json_is_kept_as_evidence_and_intent_stays_incomplete(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=TimeoutJsonWorker(),  # type: ignore[arg-type]
+            reasoner=EmptyReasoner(),  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id, release_project=False)
+
+        saved = client.project
+        evidence = [fact.description for fact in saved.facts.values() if fact.kind == FactKind.EVIDENCE]
+        self.assertEqual(
+            evidence,
+            ["hidden SSRF endpoint /internal/fetch", "internal MySQL 5.7.29:3306"],
+        )
+        self.assertFalse(any(fact.kind == FactKind.REFUTED for fact in saved.facts.values()))
+        self.assertFalse(saved.intents[0].is_completed)
+        self.assertEqual(saved.intents[0].outcome, IntentOutcome.ERROR)
+        self.assertTrue(all(fact.is_plannable for fact in saved.facts.values() if fact.kind == FactKind.EVIDENCE))
+
+    def test_timed_out_worker_result_keeps_partial_facts(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_intent("继续探测", from_fact_id=0, to_fact_id=1)
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=PartialTimeoutWorker(),  # type: ignore[arg-type]
+            reasoner=EmptyReasoner(),  # type: ignore[arg-type]
+        )
+
+        dispatcher.run_once(project.id, release_project=False)
+
+        saved = client.project
+        evidence = [fact.description for fact in saved.facts.values() if fact.kind == FactKind.EVIDENCE]
+        self.assertEqual(
+            evidence,
+            ["hidden SSRF endpoint /internal/fetch", "internal MySQL 5.7.29:3306"],
+        )
+        self.assertFalse(saved.intents[0].is_completed)
+        self.assertEqual(saved.intents[0].outcome, IntentOutcome.ERROR)
+
+    def test_wrapper_only_answer_does_not_complete(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("agent reported possible final answer: flag{graph}", fact_id=2)
         seed = project.add_intent("initial discovery", from_fact_id=0, to_fact_id=2)
         seed.mark_running()
         seed.mark_completed()
-        return project
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=FixedAnswerReasoner("flag{graph}"),  # type: ignore[arg-type]
+        )
 
-    def _dispatcher(self, project: Project) -> tuple[Dispatcher, MemoryProjectClient]:
+        result = dispatcher.run_once(project.id, release_project=False)
+
+        self.assertNotEqual(result.mode, DispatchMode.COMPLETED)
+        self.assertNotEqual(client.project.status, ProjectStatus.COMPLETED)
+
+    def test_wrapper_with_external_source_can_complete(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact(
+            "agent reported possible final answer: flag{graph}\nsource: HTTP/1.1 200 body flag{graph}",
+            fact_id=2,
+        )
+        seed = project.add_intent("initial discovery", from_fact_id=0, to_fact_id=2)
+        seed.mark_running()
+        seed.mark_completed()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=FixedAnswerReasoner("flag{graph}"),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id, release_project=False)
+
+        self.assertEqual(result.mode, DispatchMode.COMPLETED)
+        self.assertEqual(client.project.status, ProjectStatus.COMPLETED)
+
+    def test_refuted_fact_cannot_complete_project(self) -> None:
+        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
+        project.add_fact("start", fact_id=0)
+        project.add_fact("goal", fact_id=1)
+        project.add_fact("decoy flag{graph}", fact_id=2, kind=FactKind.REFUTED)
+        seed = project.add_intent("initial discovery", from_fact_id=0, to_fact_id=1)
+        seed.mark_running()
+        seed.mark_completed()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=FixedAnswerReasoner("flag{graph}"),  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id, release_project=False)
+
+        self.assertNotEqual(result.mode, DispatchMode.COMPLETED)
+        self.assertNotEqual(client.project.status, ProjectStatus.COMPLETED)
+
+    def test_salvaged_empty_plan_does_not_count_as_no_progress(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
         client = MemoryProjectClient(project)
         dispatcher = Dispatcher(
             client=client,  # type: ignore[arg-type]
             worker=StaticWorker("unused"),  # type: ignore[arg-type]
             reasoner=SalvagedEmptyReasoner(),  # type: ignore[arg-type]
         )
-        return dispatcher, client
 
-    def test_salvaged_empty_plan_does_not_count_as_no_progress(self) -> None:
-        dispatcher, _ = self._dispatcher(self._project_ready_for_reason())
+        result = dispatcher.run_once(project.id, release_project=False)
 
-        result = dispatcher.run_once(1)
-
-        self.assertEqual(result.mode, DispatchMode.REASON)
-        self.assertIn("salvaged after timeout", result.message)
+        self.assertEqual(result.message, "reason salvaged after timeout; will retry")
         self.assertEqual(dispatcher._no_progress_reasons, 0)
         self.assertEqual(dispatcher._reason_salvage_failures, 1)
 
-    def test_repeated_salvage_stops_with_explicit_reason(self) -> None:
-        dispatcher, _ = self._dispatcher(self._project_ready_for_reason())
-
-        result = None
-        for _ in range(dispatcher.max_reason_salvage_failures):
-            result = dispatcher.run_once(1)
-
-        self.assertIsNotNone(result)
-        self.assertEqual(result.mode, DispatchMode.SKIPPED)
-        self.assertIn("timed out repeatedly", result.message)
-
-
-class AnswerProvenanceTests(unittest.TestCase):
-    @staticmethod
-    def _project_with_fact(description: str, kind: str = "evidence") -> Project:
-        project = Project(id=1, name="test", status=ProjectStatus.ACTIVE)
-        project.add_fact("start", fact_id=0)
-        project.add_fact("goal", fact_id=1)
-        project.add_fact(description, fact_id=2, kind=kind)
-        return project
-
-    def test_answer_from_real_evidence_is_provenance_evidence(self) -> None:
-        project = self._project_with_fact("靶机 /flag 返回 CTF2{abc}")
-
-        self.assertEqual(Dispatcher._answer_provenance(project, "CTF2{abc}"), "evidence")
-        self.assertTrue(Dispatcher._answer_in_evidence(project, "CTF2{abc}"))
-
-    def test_answer_only_in_wrapper_is_self_report(self) -> None:
-        project = self._project_with_fact("agent reported possible final answer: CTF2{abc}")
-
-        self.assertEqual(Dispatcher._answer_provenance(project, "CTF2{abc}"), "self-report")
-        self.assertTrue(Dispatcher._answer_in_evidence(project, "CTF2{abc}"))
-
-    def test_answer_only_in_salvage_excerpt_is_not_accepted(self) -> None:
-        project = self._project_with_fact("未完成执行的输出摘录：\nCTF2{abc}")
-
-        self.assertIsNone(Dispatcher._answer_provenance(project, "CTF2{abc}"))
-        self.assertFalse(Dispatcher._answer_in_evidence(project, "CTF2{abc}"))
-
-    def test_empty_answer_has_no_provenance(self) -> None:
-        project = self._project_with_fact("CTF2{abc}")
-
-        self.assertIsNone(Dispatcher._answer_provenance(project, "  "))
-
-
-class AnswerSourceContextTests(unittest.TestCase):
-    def test_context_extracts_around_answer(self) -> None:
-        from echo_agent.dispatcher.agents import answer_source_context
-
-        raw = "progress line\nH3: /['CTF2{abc}']\ntrailing line"
-
-        context = answer_source_context(raw, "CTF2{abc}")
-
-        self.assertIsNotNone(context)
-        self.assertIn("CTF2{abc}", context or "")
-        self.assertIn("H3", context or "")
-
-    def test_context_returns_none_when_answer_absent(self) -> None:
-        from echo_agent.dispatcher.agents import answer_source_context
-
-        self.assertIsNone(answer_source_context("no flag here", "CTF2{abc}"))
-        self.assertIsNone(answer_source_context("", "CTF2{abc}"))
-        self.assertIsNone(answer_source_context("text", ""))
-
-    def test_fact_text_includes_source_line(self) -> None:
-        result = WorkerResult(
-            answer="CTF2{abc}",
-            answer_source="H3: /['CTF2{abc}']",
+    def test_repeated_reason_timeout_stops_without_no_progress(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=TimeoutReasoner(),  # type: ignore[arg-type]
+            max_retryable_attempts=1,
         )
 
-        text = Dispatcher._worker_result_fact_text(result)
+        results = dispatcher.run_loop(project.id, interval_seconds=0, max_steps=1)
 
-        self.assertIn("agent reported possible final answer: CTF2{abc}", text or "")
-        self.assertIn("source: H3", text or "")
+        self.assertEqual(results[-1].message, "reason timed out repeatedly without producing a plan")
+        self.assertEqual(dispatcher._no_progress_reasons, 0)
+        self.assertEqual(dispatcher._reason_failures, 0)
+
+    def test_reason_prose_is_repaired_before_another_full_plan(self) -> None:
+        project = DispatcherFactInsertionTests._project_ready_for_reason()
+        client = MemoryProjectClient(project)
+        reasoner = RepairableReasoner()
+        dispatcher = Dispatcher(
+            client=client,  # type: ignore[arg-type]
+            worker=StaticWorker("unused"),  # type: ignore[arg-type]
+            reasoner=reasoner,  # type: ignore[arg-type]
+        )
+
+        result = dispatcher.run_once(project.id, release_project=False)
+
+        self.assertEqual(reasoner.calls, 1)
+        self.assertEqual(result.message, "planned 0 intents")
+        self.assertEqual(
+            [fact.description for fact in client.project.facts.values()],
+            ["start", "goal", "web service exposes upload form"],
+        )
+
+    def test_json_parse_failure_and_upstream_overload_are_retryable(self) -> None:
+        self.assertTrue(
+            Dispatcher._is_retryable_failure(RuntimeError("explore output does not contain a JSON object"))
+        )
+        self.assertTrue(
+            Dispatcher._is_retryable_failure(
+                RuntimeError("codex agent transient upstream failure in explore mode with exit code 1")
+            )
+        )
+        self.assertTrue(Dispatcher._is_retryable_failure(RuntimeError("provider overloaded, reconnecting")))
 
 
 if __name__ == "__main__":

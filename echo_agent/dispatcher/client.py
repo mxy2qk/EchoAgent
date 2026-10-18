@@ -13,12 +13,6 @@ class ProjectAPIError(RuntimeError):
     pass
 
 
-# 本机 HTTP 调用的瞬时故障（典型如 Windows 临时端口耗尽 WinError 10048）不该让整个
-# run-loop 裸退，退避重试即可恢复。
-_REQUEST_ATTEMPTS = 3
-_REQUEST_BACKOFF_SECONDS = 0.5
-
-
 class ProjectClient:
     def __init__(self, base_url: str, auth_token: str | None = None) -> None:
         self.base_url = base_url.rstrip("/")
@@ -145,13 +139,12 @@ class ProjectClient:
         )
         if self.auth_token:
             request.add_header("X-Echo-Agent-Token", self.auth_token)
-        last_error: Exception | None = None
-        for attempt in range(1, _REQUEST_ATTEMPTS + 1):
+        last_error: URLError | None = None
+        for attempt in range(3):
             try:
                 with urlopen(request, timeout=10) as response:
                     return json.loads(response.read().decode("utf-8"))
             except HTTPError as exc:
-                # HTTPError 是 URLError 的子类，必须排在前面：服务端明确返回的错误码不重试。
                 raw = exc.read().decode("utf-8")
                 try:
                     data = json.loads(raw)
@@ -161,9 +154,23 @@ class ProjectClient:
                 raise ProjectAPIError(f"{method} {path} failed: {exc.code} {detail}") from exc
             except URLError as exc:
                 last_error = exc
-                if attempt >= _REQUEST_ATTEMPTS:
+                if attempt >= 2 or not _is_transient_url_error(exc):
                     break
-                time.sleep(_REQUEST_BACKOFF_SECONDS * attempt)
-        raise ProjectAPIError(
-            f"{method} {path} failed after {_REQUEST_ATTEMPTS} attempts: {last_error}"
-        ) from last_error
+                time.sleep(0.2 * (attempt + 1))
+        reason = last_error.reason if last_error is not None else "request failed"
+        raise ProjectAPIError(f"{method} {path} failed: {reason}") from last_error
+
+
+def _is_transient_url_error(exc: URLError) -> bool:
+    reason = exc.reason
+    text = f"{exc} {reason} {getattr(reason, 'errno', '')}".lower()
+    markers = (
+        "timed out",
+        "timeout",
+        "connection refused",
+        "connection reset",
+        "10048",
+        "address already in use",
+        "只允许使用一次",
+    )
+    return any(marker in text for marker in markers)

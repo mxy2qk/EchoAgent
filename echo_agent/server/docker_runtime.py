@@ -107,8 +107,6 @@ class DockerProjectRuntime:
                     "-d",
                     "--name",
                     container,
-                    # 隔离：把 Docker Desktop 的宿主机别名指回容器自身，
-                    # 防止 worker 内的 agent 直接访问宿主机上的 EchoAgent 控制台。
                     "--add-host",
                     "host.docker.internal:127.0.0.1",
                     "--add-host",

@@ -8,7 +8,16 @@ from typing import Iterable, Mapping
 
 from echo_agent.dispatcher.agents import CodexDockerAgent, CodexReasoner, CodexWorker
 from echo_agent.dispatcher.client import ProjectClient
-from echo_agent.dispatcher.parsing import ReasonFormatError, _optional_fact_description, strip_prompt_template_text
+from echo_agent.dispatcher.parsing import (
+    ReasonFormatError,
+    _optional_fact_description,
+    is_template_reason_intent,
+    parse_reason_result,
+    parse_worker_result,
+    repair_reason_output,
+    strip_prompt_template_text,
+    strip_result_json_text,
+)
 from echo_agent.dispatcher.prompts import PromptBuilder
 from echo_agent.dispatcher.types import (
     AgentAdapter,
@@ -34,12 +43,31 @@ from echo_agent.models import (
 )
 
 
+def step_consumes_budget(result: DispatchResult) -> bool:
+    message = result.message or ""
+    if message.startswith("planned 0"):
+        return False
+    if message in {
+        "reason failed; will retry",
+        "reason output was not JSON; will retry",
+        "reason skipped",
+        "reason timed out; will retry",
+        "reason salvaged after timeout; will retry",
+    }:
+        return False
+    return True
+
+
+def step_requests_trailing_explore(result: DispatchResult) -> bool:
+    message = result.message or ""
+    return message.startswith("planned ") and not message.startswith("planned 0")
+
+
 class Dispatcher:
     _OUTPUT_TAIL_MARKER = "\noutput_tail:\n"
     _PARTIAL_OUTPUT_PREFIX = "未完成执行的输出摘录："
     _PARTIAL_OUTPUT_MIN_CHARS = 40
     _PARTIAL_OUTPUT_LIMIT = 4000
-    _ANSWER_WRAPPER_PREFIX = "agent reported possible final answer:"
 
     def __init__(
         self,
@@ -87,6 +115,7 @@ class Dispatcher:
         self._reason_salvage_failures = 0
         self.max_reason_salvage_failures = max_retryable_attempts * 2
         self._no_progress_reasons = 0
+        self._target_offline_streak = 0
         if agent is None:
             agent = CodexDockerAgent(
                 codex_command=codex_command,
@@ -128,33 +157,31 @@ class Dispatcher:
         interval_seconds: float = 3.0,
         max_steps: int | None = None,
     ) -> list[DispatchResult]:
-        results: list[DispatchResult] = []
-        steps = 0
         if max_steps == 0:
-            return results
-        while max_steps is None or steps < max_steps:
-            try:
+            return []
+        results: list[DispatchResult] = []
+        try:
+            steps = 0
+            while max_steps is None or steps < max_steps:
+                if self._stop_event.is_set():
+                    break
                 project = self.client.get_project(project_id)
                 result = self._run_project_step(project, release_project=False)
-            except Exception as exc:
-                # 单步意外失败不应让 run-loop 裸退、把项目留在 running/容器不释放。
-                self._log(
-                    project_id,
-                    f"run loop step failed: {type(exc).__name__}: {exc}",
-                    "error",
-                )
-                break
-            results.append(result)
-            steps += 1
-            if result.mode in {DispatchMode.COMPLETED, DispatchMode.SKIPPED}:
-                break
-            time.sleep(interval_seconds)
-        try:
-            self._release_project_if_running(project_id)
-        except Exception:
-            # 收尾尽力而为：释放失败不能遮蔽上面的原始失败原因。
-            pass
-        return results
+                results.append(result)
+                if result.mode in {DispatchMode.COMPLETED, DispatchMode.SKIPPED} or self._stop_event.is_set():
+                    break
+                if step_consumes_budget(result):
+                    steps += 1
+                    if max_steps is not None and steps >= max_steps:
+                        self._append_trailing_explore(project_id, result, results)
+                        break
+                time.sleep(interval_seconds)
+            return results
+        finally:
+            try:
+                self._release_project_if_running(project_id)
+            except Exception:
+                pass
 
     def _run_project_step(self, project: Project, release_project: bool) -> DispatchResult:
         if project.is_completed:
@@ -176,15 +203,7 @@ class Dispatcher:
         recovered = self._recover_stranded_intents(project)
         mode = self._enter_running(project)
         self.client.save_project(project)
-        # 日志要反映**实际**要走的分支：_enter_running 只会返回 first_run/explore，
-        # 直接用它打印会让 reason 步也显示 "entered explore mode"（BUG-003）。
-        if project.is_first_run:
-            actual_mode = DispatchMode.FIRST_RUN
-        elif project.active_intents():
-            actual_mode = DispatchMode.EXPLORE
-        else:
-            actual_mode = DispatchMode.REASON
-        self._log(project.id, f"project entered {actual_mode.value} mode", "info", {"status": project.status.value})
+        self._log(project.id, f"project entered {mode.value} mode", "info", {"status": project.status.value})
         if recovered:
             self._log(
                 project.id,
@@ -222,6 +241,10 @@ class Dispatcher:
             "info" if not result.retryable else "warning",
             {"intent_id": intent.id, "retryable": result.retryable},
         )
+        self._observe_target(item.result)
+        offline = self._target_offline_result(project)
+        if offline is not None:
+            return offline
         return DispatchResult(project.id, DispatchMode.FIRST_RUN, project.status, "initial intent executed")
 
     def _explore(
@@ -240,6 +263,7 @@ class Dispatcher:
 
         finished_count = 0
         released_count = 0
+        finished_items: list[IntentExecutionResult] = []
         for item in self._execute_intents(project, intents):
             try:
                 self._commit_intent_result(project, item)
@@ -272,6 +296,9 @@ class Dispatcher:
                     "retryable": item.result.retryable,
                 },
             )
+            finished_items.append(item)
+        for item in sorted(finished_items, key=lambda finished: finished.intent.id):
+            self._observe_target(item.result)
 
         with self._state_lock:
             self._persist_step(project, release_project=release_project)
@@ -280,6 +307,9 @@ class Dispatcher:
             f"explore finished {finished_count} intents, released {released_count}",
             "info",
         )
+        offline = self._target_offline_result(project)
+        if offline is not None:
+            return offline
         return DispatchResult(
             project.id,
             mode,
@@ -297,19 +327,29 @@ class Dispatcher:
             try:
                 result = self._call_reasoner(project)
             except ReasonFormatError as exc:
-                # 模型的**输出格式**问题（只给了推理散文、没给 JSON），不是基础设施故障。
-                # 先就地重采样一次；仍失败才计入格式失败计数。
-                self._log(
-                    project.id,
-                    f"reason output was not a JSON object; retrying once: {exc}",
-                    "warning",
-                    {"error": str(exc)},
-                )
-                try:
-                    result = self._call_reasoner(project)
-                except ReasonFormatError as retry_exc:
-                    return self._reason_format_failure(project, retry_exc, release_project=release_project)
-                self._reason_format_failures = 0
+                repaired = self._reason_result_from_repair(exc)
+                if repaired is not None:
+                    self._log(project.id, "reason prose repaired into JSON", "warning")
+                    result = repaired
+                else:
+                    self._log(
+                        project.id,
+                        f"reason output was not a JSON object; retrying once: {exc}",
+                        "warning",
+                        {"error": str(exc)},
+                    )
+                    try:
+                        result = self._call_reasoner(project)
+                    except ReasonFormatError as retry_exc:
+                        repaired = self._reason_result_from_repair(retry_exc)
+                        if repaired is None:
+                            return self._reason_format_failure(
+                                project,
+                                retry_exc,
+                                release_project=release_project,
+                            )
+                        self._log(project.id, "reason prose repaired into JSON", "warning")
+                        result = repaired
             except Exception as exc:
                 if self._is_timeout_failure(exc):
                     return self._reason_timeout_failure(project, exc, release_project=release_project)
@@ -334,29 +374,13 @@ class Dispatcher:
                     project.status,
                     "reason completion deferred",
                 )
-            if result.answer and self._answer_in_evidence(project, result.answer):
-                provenance = self._answer_provenance(project, result.answer)
-                if provenance == "self-report":
-                    # 答案只出现在「agent reported possible final answer」包装事实里，
-                    # 属模型自述，未经独立验证；不阻断完成，但必须留痕（BUG-002）。
-                    self._log(
-                        project.id,
-                        "completion relies on model self-report; answer was not found in an "
-                        "independently verified fact",
-                        "warning",
-                        {"answer": result.answer, "provenance": provenance},
-                    )
+            if result.answer and self._answer_provenance(project, result.answer) == "verified":
                 self._set_end_fact_result(project, result.answer)
                 self._connect_answer_fact_to_goal(project, result.answer)
                 self._complete_project(project)
                 self._no_progress_reasons = 0
                 self._persist_step(project, release_project=release_project)
-                self._log(
-                    project.id,
-                    "reason marked project completed",
-                    "success",
-                    {"has_answer": True, "provenance": provenance},
-                )
+                self._log(project.id, "reason marked project completed", "success", {"has_answer": True})
                 return DispatchResult(project.id, DispatchMode.COMPLETED, project.status, "reason marked project completed")
             self._log(
                 project.id,
@@ -371,7 +395,7 @@ class Dispatcher:
         skipped_from = 0
         for item in planned_intents:
             description = str(item.get("description", "")).strip()
-            if not description:
+            if not description or is_template_reason_intent(item):
                 continue
             raw_from = item.get("from")
             if raw_from is None:
@@ -401,13 +425,11 @@ class Dispatcher:
             )
             planned_count += 1
         if planned_count == 0 and result.salvaged:
-            # 超时/中断后的 salvage 空规划，不代表模型没有方向（BUG-013）：
-            # 不计入 no-progress，改用独立的、更宽松的计数。
             self._reason_salvage_failures += 1
             self._persist_step(project, release_project=release_project)
             self._log(
                 project.id,
-                f"reason produced no plan after salvage "
+                f"reason produced no plan after timeout salvage "
                 f"({self._reason_salvage_failures}/{self.max_reason_salvage_failures}); will retry",
                 "warning",
             )
@@ -559,11 +581,12 @@ class Dispatcher:
         if not detail or cls._OUTPUT_TAIL_MARKER not in detail:
             return
         tail = strip_prompt_template_text(detail.split(cls._OUTPUT_TAIL_MARKER, 1)[1]).strip()
+        tail = strip_result_json_text(tail).strip()
         if len(tail) < cls._PARTIAL_OUTPUT_MIN_CHARS:
             return
         if len(tail) > cls._PARTIAL_OUTPUT_LIMIT:
             tail = tail[-cls._PARTIAL_OUTPUT_LIMIT:]
-        project.add_fact(f"{cls._PARTIAL_OUTPUT_PREFIX}\n{tail}", kind=FactKind.EVIDENCE)
+        project.add_fact(f"{cls._PARTIAL_OUTPUT_PREFIX}\n{tail}", kind=FactKind.ERROR)
 
     @staticmethod
     def _is_goal_or_evidence(project: Project, fact_id: int) -> bool:
@@ -572,34 +595,41 @@ class Dispatcher:
             return False
         return fact.kind in {FactKind.GOAL, FactKind.EVIDENCE}
 
-    @staticmethod
-    def _answer_provenance(project: Project, answer: str) -> str | None:
-        """返回答案来源：evidence（真实事实）/ self-report（仅模型自述包装）/ None。
+    _ANSWER_WRAPPER_PREFIX = "agent reported possible final answer:"
 
-        超时/中断留下的输出摘录不是结论，即使里面出现答案字符串也不采信（BUG-002/005）。
-        若答案只出现在 `agent reported possible final answer:` 包装事实里，说明它来自
-        模型自述而非已落盘的验证事实，调用方应留痕但不据此拒绝完成。
-        """
+    @staticmethod
+    def _answer_source_line(description: str) -> str:
+        for line in description.splitlines():
+            if line.startswith("source:"):
+                return line.split(":", 1)[1].strip()
+        return ""
+
+    @classmethod
+    def _fact_supports_answer(cls, fact: object, answer: str) -> bool:
+        kind = getattr(fact, "kind", None)
+        description = str(getattr(fact, "description", ""))
+        if kind != FactKind.EVIDENCE or answer not in description:
+            return False
+        if description.startswith(cls._PARTIAL_OUTPUT_PREFIX):
+            return False
+        if description.startswith(cls._ANSWER_WRAPPER_PREFIX):
+            source = cls._answer_source_line(description)
+            return bool(source and answer in source)
+        return True
+
+    @classmethod
+    def _answer_provenance(cls, project: Project, answer: str) -> str | None:
         text = answer.strip()
         if not text:
             return None
-        self_report = False
-        for fact in sorted(project.facts.values(), key=lambda item: item.id):
-            if fact.kind != FactKind.EVIDENCE:
-                continue
-            if text not in fact.description:
-                continue
-            if fact.description.startswith(Dispatcher._PARTIAL_OUTPUT_PREFIX):
-                continue
-            if fact.description.startswith(Dispatcher._ANSWER_WRAPPER_PREFIX):
-                self_report = True
-                continue
-            return "evidence"
-        return "self-report" if self_report else None
+        for fact in project.facts.values():
+            if cls._fact_supports_answer(fact, text):
+                return "verified"
+        return None
 
     @classmethod
     def _answer_in_evidence(cls, project: Project, answer: str) -> bool:
-        return cls._answer_provenance(project, answer) is not None
+        return cls._answer_provenance(project, answer) == "verified"
 
     @staticmethod
     def _valid_fact_id(project: Project, value: object) -> int | None:
@@ -723,15 +753,12 @@ class Dispatcher:
             "bad gateway",
             "service unavailable",
             "gateway timeout",
-            # 上游过载 / 流中断：属瞬时故障，重试即可（BUG-010）。
             "high demand",
             "overloaded",
             "stream disconnected",
             "reconnecting",
-            # 模型没给出 JSON 对象属**输出格式**问题而非故障，同样先重试一次，
-            # 由 _consume_retry_budget 兜住次数（BUG-011 的 explore 侧）。
+            "disconnected before completion",
             "does not contain a json object",
-            # agents.py 命中上游瞬时错误时抛出的固定短语（BUG-010）。
             "transient upstream failure",
         )
         if any(marker in text for marker in markers):
@@ -769,9 +796,18 @@ class Dispatcher:
             if intent.status == IntentStatus.RUNNING:
                 intent.release()
             return
+        if result.timed_out:
+            Dispatcher._store_worker_observations(project, result)
+            if intent.status == IntentStatus.RUNNING:
+                intent.mark_failed(
+                    IntentOutcome.ERROR,
+                    note="execution timed out after partial facts were saved; intent left incomplete",
+                )
+            return
         for prior in result.prior_results:
             Dispatcher._add_prior_fact(project, prior)
         if result.outcome == "error":
+            Dispatcher._persist_json_facts_from_detail(project, result.detail)
             Dispatcher._record_partial_output(project, result.detail)
             if intent.status == IntentStatus.RUNNING:
                 intent.mark_failed(IntentOutcome.ERROR, note=result.detail or "execution failed")
@@ -795,14 +831,52 @@ class Dispatcher:
 
 
     @staticmethod
+    def _store_worker_observations(project: Project, result: WorkerResult) -> int:
+        observations = list(result.prior_results)
+        if result.fact_description or result.answer:
+            observations.append(
+                WorkerObservation(
+                    answer=result.answer,
+                    fact_description=result.fact_description,
+                    outcome=result.outcome,
+                    answer_source=result.answer_source,
+                )
+            )
+        before = len(project.facts)
+        for observation in observations:
+            Dispatcher._add_prior_fact(project, observation)
+        return len(project.facts) - before
+
+    @classmethod
+    def _persist_json_facts_from_detail(cls, project: Project, detail: str | None) -> int:
+        if not detail or cls._OUTPUT_TAIL_MARKER not in detail:
+            return 0
+        tail = detail.split(cls._OUTPUT_TAIL_MARKER, 1)[1]
+        try:
+            parsed = parse_worker_result(tail)
+        except ValueError:
+            return 0
+        return cls._store_worker_observations(project, parsed)
+
+    @staticmethod
+    def _reason_result_from_repair(exc: ReasonFormatError) -> ReasonResult | None:
+        repaired = repair_reason_output(getattr(exc, "output", "") or "")
+        if not repaired:
+            return None
+        try:
+            return parse_reason_result(repaired)
+        except (ReasonFormatError, ValueError):
+            return None
+
+    @staticmethod
     def _add_prior_fact(project: Project, observation: WorkerObservation) -> None:
         fact_text = _optional_fact_description(observation.fact_description)
         if not fact_text and observation.answer:
             fact_text = f"agent reported possible final answer: {observation.answer}"
-            if observation.answer_source:
-                fact_text = f"{fact_text}\nsource: {observation.answer_source}"
         if not fact_text:
             return
+        if observation.answer_source:
+            fact_text = f"{fact_text}\nsource: {observation.answer_source}"
         if observation.outcome == "refuted":
             project.add_fact(fact_text, kind=FactKind.REFUTED)
             return
@@ -860,46 +934,33 @@ class Dispatcher:
             ),
         )
 
-    def _call_reasoner(self, project: Project):
-        if self._reasoner_accepts_log:
-            return self.reasoner.plan(project, log=self._agent_log(project.id))  # type: ignore[call-arg]
-        return self.reasoner.plan(project)
-
-    def _reason_format_failure(
+    def _reason_failure_result(
         self,
         project: Project,
         exc: Exception,
         release_project: bool,
     ) -> DispatchResult:
-        """reason 输出始终不是可解析的 JSON。
-
-        与 `_reason_failure_result` 的关键区别：这**不计入** `_reason_failures`，
-        因此不会被当作「reason made no progress / reason failed repeatedly」而误判为无解。
-        达到上限时给出明确的终止原因，而不是伪装成「没有进展」。
-        """
-        self._reason_format_failures += 1
-        fatal = self._reason_format_failures >= self.max_retryable_attempts
+        self._reason_failures += 1
         self._log(
             project.id,
-            f"reason output was not a JSON object (format failure "
-            f"{self._reason_format_failures}/{self.max_retryable_attempts})",
-            "error" if fatal else "warning",
-            {"attempt": self._reason_format_failures, "error": str(exc)},
+            f"reason failed: {type(exc).__name__}: {exc}",
+            "error" if self._reason_failures >= self.max_retryable_attempts else "warning",
+            {"attempt": self._reason_failures, "error": str(exc)},
         )
         self._persist_step(project, release_project=release_project)
-        if fatal and not self._stop_event.is_set():
+        if self._reason_failures >= self.max_retryable_attempts and not self._stop_event.is_set():
             return DispatchResult(
                 project.id,
                 DispatchMode.SKIPPED,
                 project.status,
-                f"reason output was never a valid JSON object: {exc}",
+                "reason failed repeatedly",
             )
-        return DispatchResult(
-            project.id,
-            DispatchMode.REASON,
-            project.status,
-            "reason output was not JSON; will retry",
-        )
+        return DispatchResult(project.id, DispatchMode.REASON, project.status, "reason failed; will retry")
+
+    def _call_reasoner(self, project: Project) -> ReasonResult:
+        if self._reasoner_accepts_log:
+            return self.reasoner.plan(project, log=self._agent_log(project.id))  # type: ignore[call-arg]
+        return self.reasoner.plan(project)
 
     @staticmethod
     def _is_timeout_failure(exc: Exception) -> bool:
@@ -912,7 +973,6 @@ class Dispatcher:
         exc: Exception,
         release_project: bool,
     ) -> DispatchResult:
-        """reason 调用超时（墙钟或无输出），不代表模型没有方向（BUG-013）。"""
         self._reason_salvage_failures += 1
         self._persist_step(project, release_project=release_project)
         self._log(
@@ -937,28 +997,35 @@ class Dispatcher:
             "reason timed out; will retry",
         )
 
-    def _reason_failure_result(
+    def _reason_format_failure(
         self,
         project: Project,
         exc: Exception,
         release_project: bool,
     ) -> DispatchResult:
-        self._reason_failures += 1
+        self._reason_format_failures += 1
+        fatal = self._reason_format_failures >= self.max_retryable_attempts
         self._log(
             project.id,
-            f"reason failed: {type(exc).__name__}: {exc}",
-            "error" if self._reason_failures >= self.max_retryable_attempts else "warning",
-            {"attempt": self._reason_failures, "error": str(exc)},
+            f"reason output was not a JSON object (format failure "
+            f"{self._reason_format_failures}/{self.max_retryable_attempts})",
+            "error" if fatal else "warning",
+            {"attempt": self._reason_format_failures, "error": str(exc)},
         )
         self._persist_step(project, release_project=release_project)
-        if self._reason_failures >= self.max_retryable_attempts and not self._stop_event.is_set():
+        if fatal and not self._stop_event.is_set():
             return DispatchResult(
                 project.id,
                 DispatchMode.SKIPPED,
                 project.status,
-                "reason failed repeatedly",
+                f"reason output was never a valid JSON object: {exc}",
             )
-        return DispatchResult(project.id, DispatchMode.REASON, project.status, "reason failed; will retry")
+        return DispatchResult(
+            project.id,
+            DispatchMode.REASON,
+            project.status,
+            "reason output was not JSON; will retry",
+        )
 
     def _is_duplicate_intent(
         self,
@@ -999,14 +1066,14 @@ class Dispatcher:
     def _worker_result_fact_text(result: WorkerResult) -> str | None:
         fact_description = _optional_fact_description(result.fact_description)
         if fact_description:
-            return fact_description
-        if result.answer:
+            text = fact_description
+        elif result.answer:
             text = f"agent reported possible final answer: {result.answer}"
-            if result.answer_source:
-                # 附带原始输出片段，让 reason 能核验答案确实来自靶机响应（BUG-014）。
-                text = f"{text}\nsource: {result.answer_source}"
-            return text
-        return None
+        else:
+            return None
+        if result.answer_source:
+            text = f"{text}\nsource: {result.answer_source}"
+        return text
 
     @staticmethod
     def _set_end_fact_result(project: Project, answer: str) -> None:
@@ -1025,7 +1092,7 @@ class Dispatcher:
             (
                 fact
                 for fact in sorted(project.facts.values(), key=lambda item: item.id, reverse=True)
-                if fact.kind == FactKind.EVIDENCE and answer_text in fact.description
+                if Dispatcher._fact_supports_answer(fact, answer_text)
             ),
             None,
         )
@@ -1046,14 +1113,20 @@ class Dispatcher:
         intent.mark_completed()
 
     @staticmethod
+    def _dispatch_mode(project: Project) -> DispatchMode:
+        if project.is_first_run:
+            return DispatchMode.FIRST_RUN
+        if project.active_intents():
+            return DispatchMode.EXPLORE
+        return DispatchMode.REASON
+
+    @staticmethod
     def _enter_running(project: Project) -> DispatchMode:
         if project.status == ProjectStatus.ACTIVE:
-            mode = DispatchMode.FIRST_RUN if project.is_first_run else DispatchMode.EXPLORE
             project.start()
-            return mode
-        if project.status == ProjectStatus.STOPED:
+        elif project.status == ProjectStatus.STOPED:
             project.start()
-        return DispatchMode.FIRST_RUN if project.is_first_run else DispatchMode.EXPLORE
+        return Dispatcher._dispatch_mode(project)
 
     @staticmethod
     def _complete_project(project: Project) -> None:
@@ -1075,6 +1148,43 @@ class Dispatcher:
     def _release_project(project: Project) -> None:
         if project.status == ProjectStatus.RUNNING:
             project.stop()
+
+    def _append_trailing_explore(
+        self,
+        project_id: int,
+        result: DispatchResult,
+        results: list[DispatchResult],
+    ) -> None:
+        if not step_requests_trailing_explore(result) or self._stop_event.is_set():
+            return
+        project = self.client.get_project(project_id)
+        if not project.active_intents():
+            return
+        results.append(self._run_project_step(project, release_project=False))
+
+    def _observe_target(self, result: WorkerResult) -> None:
+        parts: list[str] = []
+        for value in (result.fact_description, result.detail, result.answer):
+            if value:
+                parts.append(value)
+        for prior in result.prior_results:
+            for value in (prior.fact_description, prior.answer):
+                if value:
+                    parts.append(value)
+        text = " ".join(parts).strip().lower()
+        if not text:
+            return
+        if "target not found" in text:
+            self._target_offline_streak += 1
+            return
+        self._target_offline_streak = 0
+
+    def _target_offline_result(self, project: Project) -> DispatchResult | None:
+        if self._target_offline_streak < 3:
+            return None
+        message = "target appears offline: target not found repeated 3 times"
+        self._log(project.id, message, "error", {"streak": self._target_offline_streak})
+        return DispatchResult(project.id, DispatchMode.SKIPPED, project.status, message)
 
     def _release_project_if_running(self, project_id: int) -> None:
         project = self.client.get_project(project_id)

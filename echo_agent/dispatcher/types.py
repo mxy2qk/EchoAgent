@@ -20,7 +20,6 @@ class WorkerObservation:
     answer: str | None = None
     fact_description: str | None = None
     outcome: str | None = None
-    # 答案在原始输出中出现的上下文片段，用于让 reason 核验答案来源。
     answer_source: str | None = None
 
 
@@ -32,8 +31,8 @@ class WorkerResult:
     detail: str | None = None
     outcome: str | None = None
     prior_results: list[WorkerObservation] = field(default_factory=list)
-    # 答案在原始输出中出现的上下文片段（落盘时写入 fact，供 reason 核验）。
     answer_source: str | None = None
+    timed_out: bool = False
 
     @property
     def has_answer(self) -> bool:
@@ -48,8 +47,6 @@ class ReasonResult:
     answer: str | None = None
     stop_reason: str = ""
     raw_output: str = ""
-    # 该结果来自超时/中断后的 salvage，而不是模型正常收尾。
-    # 空规划在这种情况不代表「没有方向」，不应计入 no-progress。
     salvaged: bool = False
 
 
@@ -76,8 +73,9 @@ class IntentExecutionResult:
 @dataclass(slots=True)
 class AgentRunResult:
     output: str
-    # True 表示 output 是从超时/非零退出的原始流里 salvage 出来的，而非正常收尾。
     salvaged: bool = False
+    timed_out: bool = False
+    raw_output: str = ""
 
 
 AgentLogCallback = Callable[[str, str, dict[str, object] | None], None]

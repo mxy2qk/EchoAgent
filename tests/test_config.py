@@ -73,6 +73,11 @@ items = [
         self.assertEqual(dispatcher.codex_mode_models["first_run"], "first-model")
         self.assertEqual(dispatcher.codex_mode_models["explore"], "explore-model")
         self.assertEqual(dispatcher.codex_mode_models["reason"], "reason-model")
+        self.assertEqual(dispatcher.codex_timeout_seconds, 90)
+        self.assertEqual(
+            dispatcher.codex_mode_timeout_seconds,
+            {"first_run": 90, "explore": 90, "reason": 90},
+        )
         self.assertEqual(dispatcher.codex_no_output_timeout_seconds, 12)
         self.assertEqual(
             dispatcher.codex_mode_no_output_timeout_seconds,
@@ -133,10 +138,62 @@ items = [
             settings.codex_mode_models,
             {"first_run": "gpt-5.5", "explore": "gpt-5.5", "reason": "gpt-5.5"},
         )
+        self.assertEqual(settings.codex_mode_timeout_seconds["first_run"], settings.codex_timeout_seconds)
         self.assertIsNone(settings.openai_api_key)
         self.assertEqual(settings.openai_base_url, "https://your-provider.example/v1")
         self.assertEqual(settings.codex_max_slots, 2)
 
+    def test_mode_timeout_can_override_the_global_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "echo_agent.toml"
+            config_path.write_text(
+                "[codex]\ntimeout_seconds = 90\nfirst_run_timeout_seconds = 120\n",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "ECHO_AGENT_CONFIG": str(config_path),
+                    "ECHO_AGENT_CODEX_REASON_TIMEOUT": "15",
+                },
+                clear=True,
+            ):
+                settings = DispatcherSettings.from_env()
+
+        self.assertEqual(settings.codex_timeout_seconds, 90)
+        self.assertEqual(settings.codex_first_run_timeout_seconds, 120)
+        self.assertEqual(settings.codex_explore_timeout_seconds, 90)
+        self.assertEqual(settings.codex_reason_timeout_seconds, 15)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AuthTokenConfigTests(unittest.TestCase):
+    def test_auth_token_is_optional_and_shared_with_dispatcher(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "echo_agent.toml"
+            config_path.write_text('[server]\nauth_token = "abc"\n', encoding="utf-8")
+            with patch.dict(os.environ, {"ECHO_AGENT_CONFIG": str(config_path)}, clear=True):
+                server = ServerSettings.from_env()
+                dispatcher = DispatcherSettings.from_env()
+        self.assertEqual(server.auth_token, "abc")
+        self.assertEqual(dispatcher.server_auth_token, "abc")
+
+    def test_blank_auth_token_stays_unset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "echo_agent.toml"
+            config_path.write_text('[server]\nauth_token = ""\n', encoding="utf-8")
+            with patch.dict(os.environ, {"ECHO_AGENT_CONFIG": str(config_path)}, clear=True):
+                server = ServerSettings.from_env()
+        self.assertIsNone(server.auth_token)
+
+    def test_example_reason_idle_timeout_is_long_enough_to_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "echo_agent.toml"
+            config_path.write_text("[codex]\n", encoding="utf-8")
+            with patch.dict(os.environ, {"ECHO_AGENT_CONFIG": str(config_path)}, clear=True):
+                settings = DispatcherSettings.from_env()
+        self.assertEqual(settings.codex_reason_no_output_timeout_seconds, 900)
+

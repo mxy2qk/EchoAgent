@@ -67,6 +67,8 @@ class DockerProjectRuntimeTests(unittest.TestCase):
             self.assertIn(":/home/kali/tools:rw", " ".join(command))
             self.assertIn(":/home/kali/knowledges:ro", " ".join(command))
             self.assertEqual(command[-3:], ["worker:test", "sleep", "infinity"])
+            self.assertIn("host.docker.internal:127.0.0.1", command)
+            self.assertIn("gateway.docker.internal:127.0.0.1", command)
 
     def test_existing_image_skips_build_before_creating_container(self) -> None:
         runtime = RecordingDockerProjectRuntime(
