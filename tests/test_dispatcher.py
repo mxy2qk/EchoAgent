@@ -1846,7 +1846,39 @@ class AnswerSourceBackfillTests(unittest.TestCase):
 
         self.assertEqual(result.mode, DispatchMode.REASON)
         keys = [intent.action_key for intent in client.project.intents.values()]
-        self.assertIn("verify-candidate-answer", keys)
+        self.assertTrue(
+            any(key.startswith("verify-candidate-answer") for key in keys),
+            f"expected a verify-candidate-answer intent, got {keys}",
+        )
+
+    def test_rejected_answer_is_recorded_as_finding(self) -> None:
+        project = self._project_with_evidence("some unrelated evidence")
+
+        Dispatcher._record_rejected_answer(project, "DASCTF{abc}")
+
+        matches = [
+            fact
+            for fact in project.facts.values()
+            if fact.kind == FactKind.REFUTED and "DASCTF{abc}" in fact.description
+        ]
+        self.assertEqual(len(matches), 1)
+
+        # 幂等：同一个答案重复被拒不会刷出多条事实
+        Dispatcher._record_rejected_answer(project, "DASCTF{abc}")
+        matches = [
+            fact
+            for fact in project.facts.values()
+            if fact.kind == FactKind.REFUTED and "DASCTF{abc}" in fact.description
+        ]
+        self.assertEqual(len(matches), 1)
+
+    def test_rejected_answer_ignores_empty_value(self) -> None:
+        project = self._project_with_evidence("some unrelated evidence")
+        before = len(project.facts)
+
+        Dispatcher._record_rejected_answer(project, "   ")
+
+        self.assertEqual(len(project.facts), before)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -390,20 +391,23 @@ class Dispatcher:
                 {"has_answer": bool(result.answer)},
             )
             completion_rejected = True
+            self._record_rejected_answer(project, result.answer)
 
         planned_intents = self._planned_intents_from_reason_result(project, result)
         if completion_rejected and not planned_intents and result.answer:
             # 模型声称完成但缺少证据、又没规划下一步：自动生成一条针对性验证，
-            # 避免运行停在原地（BUG-016）。
+            # 避免运行停在原地（BUG-016）。action_key 带答案哈希，避免不同候选
+            # 被同一条 intent 去重掉（BUG-018）。
+            digest = hashlib.sha1(str(result.answer).encode("utf-8")).hexdigest()[:8]
             planned_intents = [
                 {
                     "description": (
                         f"重新取证并确认候选答案 {result.answer}：从目标响应中重新获取该字符串，"
-                        "确认它确实来自靶机而非模型推测。"
+                        "确认它确实来自靶机而非模型推测；若确认无法找到，请换一个候选或继续取证。"
                     ),
                     "from": None,
                     "to": None,
-                    "action_key": "verify-candidate-answer",
+                    "action_key": f"verify-candidate-answer-{digest}",
                 }
             ]
         planned_count = 0
@@ -493,6 +497,23 @@ class Dispatcher:
             project.status,
             f"planned {planned_count} intents",
         )
+
+    @staticmethod
+    def _record_rejected_answer(project: Project, answer: str | None) -> None:
+        """把「候选答案不被证据支持」写进 findings，供下一轮 reason 参考（BUG-018）。
+
+        否则下一轮 reason 看到的上下文与上一轮几乎一致，会反复提交同一个答案。
+        """
+        text = str(answer or "").strip()
+        if not text:
+            return
+        marker = (
+            f"候选答案 {text} 未在任何证据中逐字出现，已拒绝作为最终答案；"
+            "请给出新的候选答案或继续取证。"
+        )
+        if any(fact.description == marker for fact in project.facts.values()):
+            return
+        project.add_fact(marker, kind=FactKind.REFUTED)
 
     @classmethod
     def _planned_intents_from_reason_result(
